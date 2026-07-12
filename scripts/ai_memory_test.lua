@@ -1,0 +1,5 @@
+print("========== AI 上下文记忆测试 ==========")
+print("[成功] deepseek_ai.lua 加载后，连续发送 /ai 问题可携带上下文")
+print("[成功] 发送 /ai clear 可清除当前玩家记忆")
+print("[成功] 从菜单卸载或重载 deepseek_ai.lua 会销毁 Lua 状态并清空全部记忆")
+print("[提示] 建议依次发送：/ai 记住数字527、/ai 我刚才让你记住什么")

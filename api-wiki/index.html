@@ -1,0 +1,43 @@
+﻿<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CS2LuaPlugin API Wiki</title><style>
+:root{--bg:#090b12;--panel:#111522;--line:#252b3d;--text:#e8eaf1;--muted:#959db2;--accent:#8b5cf6;--green:#34d399;--yellow:#fbbf24}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 Inter,Segoe UI,sans-serif}aside{position:fixed;width:250px;height:100vh;padding:24px;background:#0d1019;border-right:1px solid var(--line);overflow:auto}main{margin-left:250px;padding:38px;max-width:1200px}h1{font-size:34px}h2{margin-top:42px;border-bottom:1px solid var(--line);padding-bottom:9px}h3{color:#c4b5fd}a{color:#a78bfa;text-decoration:none}nav a{display:block;padding:6px 8px;color:var(--muted)}nav a:hover{color:white;background:var(--panel)}code{background:#191e2d;padding:2px 6px;border-radius:5px}pre{background:#101421;border:1px solid var(--line);padding:16px;border-radius:8px;overflow:auto}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin:10px 0}.ok{color:var(--green)}.partial{color:var(--yellow)}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left}.pill{background:#2e2055;color:#d8ccff;padding:2px 8px;border-radius:99px}</style></head><body>
+<aside><b>CS2 LUA API</b><p class="ok">API 0.7.0 · LuaJIT</p><nav><a href="#start">快速开始</a><a href="#events">events</a><a href="#network">network</a><a href="#entity">entity</a><a href="#vector">vector</a><a href="#color">color</a><a href="#globals">globals</a><a href="#utils">utils</a><a href="#common">common</a><a href="#files">files</a><a href="#db">db/json</a><a href="#namespaces">兼容状态</a></nav></aside><main>
+<h1>CS2LuaPlugin API Wiki</h1><p>Neverlose 风格 Lua 兼容层。脚本目录：<code>Counter-Strike Global Offensive\game\bin\win64\lua</code></p>
+<section id="start"><h2>快速开始</h2><pre>print("hello CS2")
+events.render:set(function()
+    -- every rendered frame
+end)
+events.player_hurt:set(function(e)
+    print(e.attacker, e.userid, e.dmg_health, e.health, e.hitgroup)
+end)</pre></section>
+<section id="events"><h2>events <span class="pill">native</span></h2><div class="card"><code>events.name:set(callback)</code> 注册或替换回调<br><code>events.name:unset()</code> 移除回调<br><code>events.name:call()</code> 手动触发</div><table><tr><th>事件</th><th>状态</th><th>参数</th></tr><tr><td>render</td><td class="ok">已接入</td><td>无</td></tr><tr><td>tick</td><td class="ok">已接入</td><td>无</td></tr><tr><td>load / shutdown</td><td class="ok">已接入</td><td>无</td></tr><tr><td>player_hurt</td><td class="ok">IGameEventManager2</td><td>e.userid, attacker, health, armor, dmg_health, dmg_armor, hitgroup, weapon</td></tr><tr><td>player_death, weapon_fire, bullet_impact, round_start/end, bomb_*</td><td class="partial">已声明</td><td>等待原生桥接</td></tr></table></section>
+<section id="entity"><h2>entity</h2><p class="partial">接口名称已预留；完整 Source 2 entity-system/netvar 桥接仍在开发。</p><pre>entity.get(index [, by_userid])
+entity.get_local_player()
+entity.get_players([enemies_only, include_dormant, callback])
+ent:get_name(); ent:is_alive(); ent:get_index(); ent:get_origin()</pre></section>
+<section id="vector"><h2>vector <span class="pill">Lua</span></h2><p><code>vector(x, y, z)</code></p><pre>:clone() :unpack() :length() :length2d() :length_sqr()
+:dist(other) :dist_sqr(other) :dot(other) :cross(other)
+:normalized() :normalize() :lerp(other,t) :angles()
+operators: + - unary- * / ==</pre></section>
+<section id="color"><h2>color <span class="pill">Lua</span></h2><p><code>color(r,g,b,a)</code> 或 <code>color("RRGGBBAA")</code></p><pre>:clone() :init() :unpack() :to_fraction() :to_hex()
+:to_int32() :lerp(other,t) :grayscale([weight]) :alpha_modulate(alpha)</pre></section>
+<section id="globals"><h2>globals</h2><pre>globals.realtime globals.curtime globals.frametime
+globals.absoluteframetime globals.tickcount globals.tickinterval
+globals.framecount globals.max_players</pre></section>
+<section id="utils"><h2>utils</h2><pre>utils.console_exec(cmd, ...) utils.execute_after(delay, callback, ...)`nutils.create_interface(module, interface) utils.opcode_scan(module, signature, offset)`nutils.random_int(min,max) utils.random_float(min,max)
+utils.random_seed(seed) utils.get_unix_time() utils.get_timestamp()
+utils.clamp(value,min,max) utils.lerp(a,b,t)</pre></section>
+<section><h2>schema / offsets</h2><p>数据由 <code>D:\Documents\CS2 LUA\output</code> 生成并随 DLL 发布。</p><pre>schema.get_offset("client.dll", "dwLocalPlayerPawn")
+schema.get_button("attack")
+schema.get_build_number()
+offsets.info / offsets.offsets / offsets.buttons</pre></section>
+<section><h2>Lua 错误报告</h2><p>语法错误、加载错误、事件回调错误和运行时错误会输出到 CS2 控制台，包含脚本文件、行号、原因和 stack traceback。</p><pre>[Lua Error] load failed [example.lua]: .../example.lua:12: unexpected symbol near 'end'
+stack traceback:
+    .../example.lua:12: in main chunk</pre></section>
+<section id="common"><h2>common</h2><pre>common.get_username()
+common.get_product_version()</pre></section>
+<section id="files"><h2>files</h2><pre>files.read(path) files.write(path,data)
+files.append(path,data) files.exists(path)</pre></section>
+<section id="db"><h2>db</h2><pre>db.read(key) db.write(key,value) db.delete(key)</pre><p>当前为进程内存存储，DLL 卸载后清空。</p></section>
+<section id="namespaces"><h2>命名空间兼容状态</h2><table><tr><th>命名空间</th><th>状态</th></tr><tr><td>events, print</td><td class="ok">原生接入</td></tr><tr><td>vector, color, bit, globals, utils, common, files, db</td><td class="ok">基础实现</td></tr><tr><td>entity</td><td class="partial">预留/部分事件数据</td></tr><tr><td>cvar, esp, json, materials, ui, network, panorama, rage, render</td><td class="partial">命名空间已创建，函数待接入</td></tr></table></section>
+<footer><p>参考：<a href="https://docs-csgo.neverlose.cc/">Neverlose Lua documentation</a>。此 Wiki 描述本项目实际兼容状态。</p></footer></main></body></html>
+
