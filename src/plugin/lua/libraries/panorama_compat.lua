@@ -184,7 +184,38 @@ is_array = function(val)
     return i ~= 1
 end
 nullptr = new('void*')
-intbuf = new('int[1]')
+-- V8 Local/MaybeLocal values are pointer-sized on win64. int[1] is only four
+-- bytes and lets every sret write corrupt adjacent LuaJIT cdata.
+intbuf = new('uintptr_t[2]')
+
+-- Prevent overlapping timer/UI callbacks from entering the same V8 isolate.
+-- V8 aborts rather than returning a Lua error when an EscapableHandleScope is
+-- reused ("Escape value set twice"), so a second call must be rejected before
+-- it reaches any V8 API.
+pcall(ffi.cdef, [[
+    void* __stdcall CreateSemaphoreA(void*, long, long, const char*);
+    unsigned long __stdcall WaitForSingleObject(void*, unsigned long);
+    int __stdcall ReleaseSemaphore(void*, long, long*);
+    int __stdcall CloseHandle(void*);
+]])
+local kernel32 = ffi.load('kernel32')
+-- Named, process-wide semaphore also protects separate Lua states/library
+-- instances. Unlike a Win32 mutex it is deliberately non-recursive.
+local v8CallGate = kernel32.CreateSemaphoreA(nil, 1, 1, 'Local\\CS2LuaPanoramaV8Gate_v1')
+if v8CallGate ~= nil and v8CallGate ~= nullptr then
+    v8CallGate = ffi.gc(v8CallGate, function(handle)
+        kernel32.CloseHandle(handle)
+    end)
+end
+
+local function tryEnterV8Call()
+    return v8CallGate ~= nil and v8CallGate ~= nullptr
+        and kernel32.WaitForSingleObject(v8CallGate, 0) == 0
+end
+
+local function leaveV8Call()
+    kernel32.ReleaseSemaphore(v8CallGate, 1, nil)
+end
 panorama = {
     panelIDs = { }
 }
@@ -727,16 +758,22 @@ do
             return obj
         end,
         get = function(self, key)
-            return MaybeLocal(v8_dll:get('?Get@Object@v8@@QEAA?AV?$MaybeLocal@VValue@v8@@@2@V?$Local@VContext@v8@@@2@V?$Local@VValue@v8@@@2@@Z', 'void*(__fastcall*)(void*,void*,void*,void*)')(self.this, intbuf, nil, key))
+            local resultBuffer = new('uintptr_t[1]')
+            v8_dll:get('?Get@Object@v8@@QEAA?AV?$MaybeLocal@VValue@v8@@@2@V?$Local@VContext@v8@@@2@V?$Local@VValue@v8@@@2@@Z', 'void*(__fastcall*)(void*,void*,void*,void*)')(self.this, resultBuffer, nil, key)
+            return MaybeLocal(resultBuffer)
         end,
         set = function(self, key, value)
             return v8_dll:get('?Set@Object@v8@@QEAA?AV?$Maybe@_N@2@V?$Local@VContext@v8@@@2@V?$Local@VValue@v8@@@2@1@Z', 'bool(__fastcall*)(void*,void*,void*,void*,void*)')(self.this, intbuf, Isolate():getCurrentContext(), key, value)
         end,
         getPropertyNames = function(self)
-            return MaybeLocal(v8_dll:get('?GetPropertyNames@Object@v8@@QEAA?AV?$MaybeLocal@VArray@v8@@@2@V?$Local@VContext@v8@@@2@@Z', 'void*(__fastcall*)(void*,void*,void*)')(self.this, intbuf, nil))
+            local resultBuffer = new('uintptr_t[1]')
+            v8_dll:get('?GetPropertyNames@Object@v8@@QEAA?AV?$MaybeLocal@VArray@v8@@@2@V?$Local@VContext@v8@@@2@@Z', 'void*(__fastcall*)(void*,void*,void*)')(self.this, resultBuffer, nil)
+            return MaybeLocal(resultBuffer)
         end,
         callAsFunction = function(self, recv, argc, argv)
-            return MaybeLocal(v8_dll:get('?CallAsFunction@Object@v8@@QEAA?AV?$MaybeLocal@VValue@v8@@@2@V?$Local@VContext@v8@@@2@V?$Local@VValue@v8@@@2@HQEAV52@@Z', 'void*(__fastcall*)(void*,void*,void*,void*,int,void*)')(self.this, intbuf, Isolate():getCurrentContext(), recv, argc, argv))
+            local resultBuffer = new('uintptr_t[1]')
+            v8_dll:get('?CallAsFunction@Object@v8@@QEAA?AV?$MaybeLocal@VValue@v8@@@2@V?$Local@VContext@v8@@@2@V?$Local@VValue@v8@@@2@HQEAV52@@Z', 'void*(__fastcall*)(void*,void*,void*,void*,int,void*)')(self.this, resultBuffer, Isolate():getCurrentContext(), recv, argc, argv)
+            return MaybeLocal(resultBuffer)
         end,
         getIdentityHash = function(self)
             return v8_dll:get('?GetIdentityHash@Object@v8@@QEAAHXZ', 'int(__thiscall*)(void*)')(self.this)
@@ -787,7 +824,9 @@ do
             return arr
         end,
         get = function(self, key)
-            return MaybeLocal(v8_dll:get('?Get@Object@v8@@QEAA?AV?$MaybeLocal@VValue@v8@@@2@V?$Local@VContext@v8@@@2@I@Z', 'void*(__fastcall*)(void*,void*,void*,unsigned int)')(self.this, intbuf, nil, key))
+            local resultBuffer = new('uintptr_t[1]')
+            v8_dll:get('?Get@Object@v8@@QEAA?AV?$MaybeLocal@VValue@v8@@@2@V?$Local@VContext@v8@@@2@I@Z', 'void*(__fastcall*)(void*,void*,void*,unsigned int)')(self.this, resultBuffer, nil, key)
+            return MaybeLocal(resultBuffer)
         end,
         set = function(self, key, value)
             return v8_dll:get('?Set@Object@v8@@QEAA?AV?$Maybe@_N@2@V?$Local@VContext@v8@@@2@IV?$Local@VValue@v8@@@2@@Z', 'bool(__fastcall*)(void*,void*,void*,unsigned int,void*)')(self.this, intbuf, Isolate():getCurrentContext(), key, value)
@@ -1362,39 +1401,59 @@ do
             if panel == nil then
                 panel = panorama.GetPanel('CSGOHud')
             end
+            if not tryEnterV8Call() then
+                panorama._lastV8Error = 'overlapping Panorama V8 call skipped'
+                return nil
+            end
             local previousPanel = activePanel
             activePanel = panel
             local isolate = Isolate()
-            isolate:enter()
-            self:enter()
-            drainPersistentDisposals()
-            local ctx
-            if panel then
-                ctx = nativeGetPanelContext(panel)[0]
-            else
-                ctx = Context(isolate:getCurrentContext()):global():getInternal()
-            end
-            ctx = Context((function()
-                if ctx ~= nullptr then
-                    return self:createHandle(ctx[0])
+            local isolateEntered, scopeEntered, contextEntered = false, false, false
+            local ctx, val
+
+            -- V8 scopes form a strict stack. Never allow a Lua exception to
+            -- skip a destructor; an unbalanced scope corrupts later calls.
+            local ok, failure = xpcall(function()
+                isolate:enter()
+                isolateEntered = true
+                self:enter()
+                scopeEntered = true
+                drainPersistentDisposals()
+
+                local rawContext
+                if panel then
+                    local panelContext = nativeGetPanelContext(panel)
+                    if panelContext ~= nil and panelContext ~= nullptr then
+                        rawContext = panelContext[0]
+                    end
                 else
-                    return 0
+                    rawContext = Context(isolate:getCurrentContext()):global():getInternal()
                 end
-            end)())
-            ctx:enter()
-            local val = nil
-            if safe_mode then
-                local status, ret = xpcall(func, exception)
-                if status then
-                    val = ret
+                if rawContext == nil or rawContext == nullptr or rawContext[0] == nullptr then
+                    _error('unable to resolve a V8 context for the selected Panorama panel', 0)
                 end
-            else
-                val = func()
-            end
-            ctx:exit()
-            self:exit()
-            isolate:exit()
+
+                ctx = Context(self:createHandle(rawContext[0]))
+                if ctx:getInternal() == nil or ctx:getInternal() == nullptr then
+                    _error('unable to create a local V8 context handle', 0)
+                end
+                ctx:enter()
+                contextEntered = true
+                val = func(ctx)
+            end, function(err)
+                return err
+            end)
+
+            if contextEntered then pcall(function() ctx:exit() end) end
+            if scopeEntered then pcall(function() self:exit() end) end
+            if isolateEntered then pcall(function() isolate:exit() end) end
             activePanel = previousPanel
+            leaveV8Call()
+
+            if not ok then
+                if safe_mode then exception(failure) end
+                return _error(failure, 0)
+            end
             return val
         end
     }
@@ -1469,58 +1528,47 @@ do
             return __thiscall(cast('void**(__thiscall*)(void*,void*,const char*,const char*)', follow_call(find_pattern('panorama.dll', 'E8 ? ? ? ? 48 8B D8 48 83 38 00 75 15'))), UIEngine:getInstance())(panel, source, layout)
         end,
         run = function(self, compiled, context)
-            return v8_dll:get('?Run@Script@v8@@QEAA?AV?$MaybeLocal@VValue@v8@@@2@V?$Local@VContext@v8@@@2@@Z', 'void*(__fastcall*)(void*, void*, void*)')(compiled, intbuf, context)
+            -- A shared sret buffer is unsafe under JS -> Lua -> JS re-entry.
+            local resultBuffer = new('uintptr_t[1]')
+            v8_dll:get('?Run@Script@v8@@QEAA?AV?$MaybeLocal@VValue@v8@@@2@V?$Local@VContext@v8@@@2@@Z', 'void*(__fastcall*)(void*, void*, void*)')(compiled, resultBuffer, context)
+            return resultBuffer
         end,
         loadstring = function(self, str, panel)
-            local compiled = MaybeLocal(self:compile(panel, str)):toLocalChecked()
-            if compiled == nullptr then
-                if safe_mode then
-                    error("\nFailed to compile the given javascript string, please check the error message above ^\n")
-                else
-                    print("\nFailed to compile the given javascript string, please check the error message above ^\n")
-                    return function()
-                        return print('WARNING: Attempted to call nullptr (script compilation failed)')
+            -- Compile and run inside the same HandleScope. Compiling before the
+            -- scope caused Local<Script> handles to accumulate outside it.
+            return HandleScope()(function(ctx)
+                local compiled = MaybeLocal(self:compile(panel, str)):toLocalChecked()
+                if compiled == nil or compiled:getInternal() == nil or compiled:getInternal() == nullptr then
+                    return _error("\nFailed to compile the given javascript string, please check the error message above ^\n", 0)
+                end
+
+                local tryCatch = TryCatch()
+                local tryCatchEntered = false
+                local ok, ret = xpcall(function()
+                    tryCatch:enter()
+                    tryCatchEntered = true
+                    return MaybeLocal(self:run(compiled():getInternal(), ctx:getInternal())):toValueChecked()
+                end, function(err)
+                    return err
+                end)
+
+                local caught = false
+                if tryCatchEntered then
+                    caught = tryCatch:hasCaught()
+                    if caught then
+                        pcall(function()
+                            nativeHandleException(tryCatch:getInternal(), panel or panorama.getPanel('CSGOHud'))
+                        end)
                     end
+                    tryCatch:exit()
                 end
-            end
-            local isolate = Isolate()
-            local handleScope = HandleScope()
-            isolate:enter()
-            handleScope:enter()
-            local ctx
-            if panel then
-                ctx = nativeGetPanelContext(panel)[0]
-            else
-                ctx = Context(isolate:getCurrentContext()):global():getInternal()
-            end
-            ctx = Context((function()
-                if ctx ~= nullptr then
-                    return handleScope:createHandle(ctx[0])
-                else
-                    return 0
+
+                if not ok then return _error(ret, 0) end
+                if ret == nil or caught then
+                    return _error("\nFailed to evaluate the given javascript string, please check the error message above ^\n", 0)
                 end
-            end)())
-            ctx:enter()
-            local tryCatch = TryCatch()
-            tryCatch:enter()
-            local ret = MaybeLocal(self:run(compiled():getInternal(), ctx:getInternal())):toValueChecked()
-            tryCatch:exit()
-            if ret == nullptr then
-                if safe_mode then
-                    error("\nFailed to evaluate the given javascript string, please check the error message above ^\n")
-                else
-                    print("\nFailed to evaluate the given javascript string, please check the error message above ^\n")
-                    ret = function()
-                        return print('WARNING: Attempted to call nullptr (script execution failed)')
-                    end
-                end
-            else
-                ret = ret:toLua()
-            end
-            ctx:exit()
-            handleScope:exit()
-            isolate:exit()
-            return ret
+                return ret:toLua()
+            end, panel)
         end
     }
     _base_0.__index = _base_0
