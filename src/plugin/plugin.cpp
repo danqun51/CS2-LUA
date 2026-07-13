@@ -5,8 +5,6 @@
 #include <iostream>
 #include <thread>
 
-extern HMODULE g_module;
-
 PluginRuntime::PluginRuntime() = default;
 PluginRuntime::~PluginRuntime() = default;
 
@@ -23,12 +21,6 @@ void PluginRuntime::teardown_console() {
   FreeConsole();
 }
 
-std::filesystem::path PluginRuntime::module_dir() const {
-  wchar_t path[MAX_PATH]{};
-  GetModuleFileNameW(g_module, path, MAX_PATH);
-  return std::filesystem::path(path).parent_path();
-}
-
 void PluginRuntime::request_stop() { stop_requested_.store(true); }
 
 void PluginRuntime::run() {
@@ -37,10 +29,11 @@ void PluginRuntime::run() {
   const auto scripts_dir = std::filesystem::path(exe_path).parent_path() / L"lua";
 
   lua_.initialize();
-  lua_.load_library_file(module_dir() / L"scripts" / L"nl_compat.lua");
-  lua_.load_table_library(module_dir() / L"scripts" / L"offsets.lua", "offsets");
-  lua_.load_table_library(module_dir() / L"scripts" / L"entity_offsets.lua", "entity_offsets");
-  lua_.load_library_file(module_dir() / L"scripts" / L"entity_compat.lua");
+  lua_.load_embedded_library("nl_compat.lua");
+  lua_.load_embedded_table_library("offsets.lua", "offsets");
+  lua_.load_embedded_table_library("entity_offsets.lua", "entity_offsets");
+  lua_.load_embedded_library("entity_compat.lua");
+  lua_.load_embedded_table_library("panorama_compat.lua", "panorama");
   lua_.set_scripts_dir(scripts_dir);
   lua_.load_all();
   menu_.initialize(lua_);

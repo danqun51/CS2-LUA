@@ -1,0 +1,7 @@
+#include "embedded_library_resources.h"
+
+IDR_LUA_NL_COMPAT       RCDATA "libraries\\nl_compat.lua"
+IDR_LUA_OFFSETS         RCDATA "libraries\\offsets.lua"
+IDR_LUA_ENTITY_OFFSETS  RCDATA "libraries\\entity_offsets.lua"
+IDR_LUA_ENTITY_COMPAT   RCDATA "libraries\\entity_compat.lua"
+IDR_LUA_PANORAMA_COMPAT RCDATA "libraries\\panorama_compat.lua"

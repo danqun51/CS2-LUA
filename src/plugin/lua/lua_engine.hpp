@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <thread>
+#include <functional>
 
 extern "C" {
 #include <lua.h>
@@ -31,6 +32,8 @@ class LuaEngine {
 
   void initialize();
   void set_scripts_dir(const std::filesystem::path& dir);
+  bool load_embedded_library(const char* name);
+  bool load_embedded_table_library(const char* name, const char* global_name);
   bool load_library_file(const std::filesystem::path& path);
   bool load_table_library(const std::filesystem::path& path, const char* global_name);
   bool load_script(const std::filesystem::path& path);
@@ -42,11 +45,13 @@ class LuaEngine {
   void reload_all();
   void tick(float dt);
   void fire_event(const std::string& name);
+  // Non-blocking variant for the render thread: skips the frame if the Lua mutex
+  // is held elsewhere.
+  bool try_fire_event(const std::string& name);
   void fire_player_hurt(int userid, int attacker, int health, int armor,
                         int damage_health, int damage_armor, int hitgroup,
                         const char* weapon);
   void fire_player_chat(int userid, bool team_only, const char* text, const char* username);
-
   [[nodiscard]] std::vector<std::filesystem::path> loaded_scripts() const;
   [[nodiscard]] std::vector<std::filesystem::path> available_scripts() const;
   [[nodiscard]] bool has_loaded_scripts() const;
@@ -54,6 +59,7 @@ class LuaEngine {
   void render_script_ui(const std::filesystem::path& path);
 
  private:
+  bool execute_embedded_library(const std::string& name, const std::string& global_name);
   void reset_state();
   void configure_package_path(const std::filesystem::path& dir);
   void call_noarg(const char* fn);
@@ -92,6 +98,7 @@ class LuaEngine {
   std::vector<std::filesystem::path> loaded_scripts_;
   std::vector<std::filesystem::path> library_files_;
   std::vector<std::pair<std::filesystem::path, std::string>> table_library_files_;
+  std::vector<std::pair<std::string, std::string>> embedded_libraries_;
   mutable std::recursive_mutex mutex_;
   std::unordered_map<std::string, int> event_callbacks_;
   std::vector<std::string> pending_console_commands_;
@@ -102,4 +109,5 @@ class LuaEngine {
   std::vector<UiItem> ui_items_;
   int next_ui_id_{1};
   std::filesystem::path current_script_;
+
 };

@@ -1,0 +1,7 @@
+#pragma once
+
+#define IDR_LUA_NL_COMPAT       201
+#define IDR_LUA_OFFSETS         202
+#define IDR_LUA_ENTITY_OFFSETS  203
+#define IDR_LUA_ENTITY_COMPAT   204
+#define IDR_LUA_PANORAMA_COMPAT 205

@@ -142,7 +142,7 @@ void RenderMenu() {
 HRESULT __stdcall HookPresent(IDXGISwapChain* chain, UINT sync, UINT flags) {
   if (!g_imgui_ready) InitRenderer(chain);
   if (g_imgui_ready) {
-    if (g_lua) g_lua->fire_event("render");
+    if (g_lua) g_lua->try_fire_event("render");
     ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     if (g_menu && g_menu->visible()) RenderMenu();
     ImGui::Render(); g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
@@ -154,7 +154,7 @@ HRESULT __stdcall HookPresent(IDXGISwapChain* chain, UINT sync, UINT flags) {
 HRESULT __stdcall HookPresent1(IDXGISwapChain1* chain, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* params) {
   if (!g_imgui_ready) InitRenderer(chain);
   if (g_imgui_ready) {
-    if (g_lua) g_lua->fire_event("render");
+    if (g_lua) g_lua->try_fire_event("render");
     ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     if (g_menu && g_menu->visible()) RenderMenu();
     ImGui::Render(); g_context->OMSetRenderTargets(1, &g_rtv, nullptr);

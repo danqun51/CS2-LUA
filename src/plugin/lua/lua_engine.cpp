@@ -1,4 +1,5 @@
-﻿#include "lua_engine.hpp"
+#include "lua_engine.hpp"
+#include "embedded_libraries.hpp"
 #include <iostream>
 #include <string>
 #include <windows.h>
@@ -35,6 +36,23 @@ void ConsoleLine(const std::string& line) {
   if (!msg && tier0) msg = reinterpret_cast<EngineMsgFn>(GetProcAddress(tier0, "ConMsg"));
   if (msg) msg("%s\n", line.c_str());
   OutputDebugStringA((line + "\n").c_str());
+}
+
+void PublishTableLibrary(lua_State* L, const char* name) {
+  const int table_index = lua_gettop(L);
+  lua_pushvalue(L, table_index);
+  lua_setglobal(L, name);
+
+  // Support both the legacy global API and normal require("name") calls.
+  lua_getglobal(L, "package");
+  if (lua_istable(L, -1)) {
+    lua_getfield(L, -1, "loaded");
+    if (lua_istable(L, -1)) {
+      lua_pushvalue(L, table_index);
+      lua_setfield(L, -2, name);
+    }
+  }
+  lua_settop(L, table_index - 1);
 }
 int LuaConsolePrint(lua_State* L) {
   std::string line;
@@ -83,6 +101,62 @@ void LuaEngine::set_scripts_dir(const std::filesystem::path& dir) {
   if (L_) configure_package_path(scripts_dir_);
 }
 
+bool LuaEngine::execute_embedded_library(const std::string& name,
+                                         const std::string& global_name) {
+  const auto source = embedded_libraries::find(name);
+  if (!source) {
+    ConsoleLine("[Lua Error] embedded library not found: " + name);
+    return false;
+  }
+
+  const std::string chunk_name = "@embedded/" + name;
+  const int result_count = global_name.empty() ? 0 : 1;
+  if (luaL_loadbuffer(L_, source->data(), source->size(), chunk_name.c_str()) != LUA_OK ||
+      lua_pcall(L_, 0, result_count, 0) != LUA_OK) {
+    report_error(name.c_str());
+    return false;
+  }
+
+  if (!global_name.empty()) {
+    if (!lua_istable(L_, -1)) {
+      lua_pop(L_, 1);
+      ConsoleLine("[Lua Error] embedded library " + name +
+                  " did not return a table");
+      return false;
+    }
+    PublishTableLibrary(L_, global_name.c_str());
+  }
+  return true;
+}
+
+bool LuaEngine::load_embedded_library(const char* name) {
+  std::lock_guard lock(mutex_);
+  if (!L_) initialize();
+  const std::string library_name = name ? name : "";
+  if (library_name.empty() || !execute_embedded_library(library_name, "")) return false;
+  const auto registration = std::make_pair(library_name, std::string{});
+  if (std::find(embedded_libraries_.begin(), embedded_libraries_.end(), registration) ==
+      embedded_libraries_.end()) {
+    embedded_libraries_.push_back(registration);
+  }
+  return true;
+}
+
+bool LuaEngine::load_embedded_table_library(const char* name, const char* global_name) {
+  std::lock_guard lock(mutex_);
+  if (!L_) initialize();
+  const std::string library_name = name ? name : "";
+  const std::string global = global_name ? global_name : "";
+  if (library_name.empty() || global.empty() ||
+      !execute_embedded_library(library_name, global)) return false;
+  const auto registration = std::make_pair(library_name, global);
+  if (std::find(embedded_libraries_.begin(), embedded_libraries_.end(), registration) ==
+      embedded_libraries_.end()) {
+    embedded_libraries_.push_back(registration);
+  }
+  return true;
+}
+
 bool LuaEngine::load_library_file(const std::filesystem::path& path) {
   std::lock_guard lock(mutex_);
   if (!L_) initialize();
@@ -102,7 +176,7 @@ bool LuaEngine::load_table_library(const std::filesystem::path& path, const char
     report_error(global_name, &path); return false;
   }
   if (!lua_istable(L_, -1)) { lua_pop(L_, 1); ConsoleLine(std::string("[Lua Error] ") + global_name + " did not return a table"); return false; }
-  lua_setglobal(L_, global_name);
+  PublishTableLibrary(L_, global_name);
   const auto key = std::make_pair(path, std::string(global_name));
   if (std::find(table_library_files_.begin(), table_library_files_.end(), key) == table_library_files_.end()) table_library_files_.push_back(key);
   return true;
@@ -131,6 +205,11 @@ void LuaEngine::reset_state() {
   event_callbacks_.clear();
   ui_items_.clear(); next_ui_id_ = 1;
   initialize();
+  for (const auto& [name, global] : embedded_libraries_) {
+    if (!execute_embedded_library(name, global)) {
+      ConsoleLine("[Lua Error] failed to restore embedded library: " + name);
+    }
+  }
   for (const auto& library : library_files_) {
     const auto utf8 = library.u8string();
     if (luaL_dofile(L_, reinterpret_cast<const char*>(utf8.c_str())) != LUA_OK) lua_pop(L_, 1);
@@ -138,7 +217,7 @@ void LuaEngine::reset_state() {
   for (const auto& [library, global] : table_library_files_) {
     const auto utf8 = library.u8string();
     if (luaL_loadfile(L_, reinterpret_cast<const char*>(utf8.c_str())) == LUA_OK && lua_pcall(L_, 0, 1, 0) == LUA_OK && lua_istable(L_, -1))
-      lua_setglobal(L_, global.c_str());
+      PublishTableLibrary(L_, global.c_str());
     else { if (lua_gettop(L_) > 0) lua_pop(L_, 1); }
   }
   if (!scripts_dir_.empty()) configure_package_path(scripts_dir_);
@@ -304,6 +383,20 @@ void LuaEngine::fire_event(const std::string& name) {
     const std::string context = "events." + name;
     report_error(context.c_str());
   }
+}
+
+bool LuaEngine::try_fire_event(const std::string& name) {
+  std::unique_lock<std::recursive_mutex> lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) return false;  // plugin thread busy; skip this frame
+  if (!L_) return true;
+  const auto it = event_callbacks_.find(name);
+  if (it == event_callbacks_.end()) return true;
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, it->second);
+  if (lua_pcall(L_, 0, 0, 0) != LUA_OK) {
+    const std::string context = "events." + name;
+    report_error(context.c_str());
+  }
+  return true;
 }
 
 void LuaEngine::fire_player_hurt(int userid, int attacker, int health, int armor,
