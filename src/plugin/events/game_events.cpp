@@ -77,6 +77,8 @@ void* g_conmsg_target{};
 ConMsgFn g_original_msg{};
 void* g_msg_target{};
 thread_local bool g_inside_conmsg{};
+bool g_logged_client_dispatch{};
+bool g_logged_fire_dispatch{};
 void EventLog(const char* text) {
   HMODULE tier0 = GetModuleHandleW(L"tier0.dll");
   auto msg = tier0 ? reinterpret_cast<ConsoleMsgFn>(GetProcAddress(tier0, "Msg")) : nullptr;
@@ -107,10 +109,24 @@ void __cdecl HookMsg(const char* format, ...) {
 }
 
 bool __fastcall HookFireEvent(IGameEventManager2* self, IGameEvent* event, bool dont_broadcast) {
+  if (!g_logged_fire_dispatch && event) {
+    g_logged_fire_dispatch = true;
+    char message[192]{};
+    std::snprintf(message, sizeof(message), "FireEvent active; first event=%s dontBroadcast=%d",
+        event->GetName() ? event->GetName() : "<null>", dont_broadcast ? 1 : 0);
+    EventLog(message);
+  }
   if (g_bridge) g_bridge->on_game_event(event);
   return g_original_fire(self, event, dont_broadcast);
 }
 bool __fastcall HookFireEventClient(IGameEventManager2* self, IGameEvent* event) {
+  if (!g_logged_client_dispatch && event) {
+    g_logged_client_dispatch = true;
+    char message[192]{};
+    std::snprintf(message, sizeof(message), "FireEventClientSide active; first event=%s",
+        event->GetName() ? event->GetName() : "<null>");
+    EventLog(message);
+  }
   if (g_bridge) g_bridge->on_game_event(event);
   return g_original_fire_client(self, event);
 }
@@ -128,6 +144,29 @@ void* PatternScan(HMODULE module, const int* pattern, size_t count) {
   for (size_t i=0; i+count<=size; ++i) {
     bool ok=true; for (size_t j=0;j<count;++j) if (pattern[j]>=0 && base[i+j]!=pattern[j]) {ok=false;break;}
     if (ok) return base+i;
+  }
+  return nullptr;
+}
+
+IGameEventManager2* RecoverExistingManager(HMODULE module, void* init_target) {
+  if (!module || !init_target) return nullptr;
+  auto* base = reinterpret_cast<unsigned char*>(module);
+  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+  const size_t image_size = nt->OptionalHeader.SizeOfImage;
+
+  // Known CGameEventManager_Init callers load the singleton into RCX directly
+  // before calling Init:
+  //   48 8B 0D xx xx xx xx    mov rcx, [rip + manager]
+  //   E8 xx xx xx xx          call CGameEventManager_Init
+  for (size_t i = 7; i + 5 <= image_size; ++i) {
+    if (base[i] != 0xE8 || base[i - 7] != 0x48 ||
+        base[i - 6] != 0x8B || base[i - 5] != 0x0D) continue;
+    const auto call_disp = *reinterpret_cast<int32_t*>(base + i + 1);
+    if (base + i + 5 + call_disp != init_target) continue;
+    const auto global_disp = *reinterpret_cast<int32_t*>(base + i - 4);
+    auto** global_slot = reinterpret_cast<IGameEventManager2**>(base + i + global_disp);
+    if (global_slot && *global_slot) return *global_slot;
   }
   return nullptr;
 }
@@ -164,39 +203,143 @@ bool GameEventBridge::initialize(LuaEngine& lua) {
   using CreateInterfaceFn = void*(__cdecl*)(const char*, int*);
   HMODULE engine = GetModuleHandleW(L"engine2.dll");
   auto create = engine ? reinterpret_cast<CreateInterfaceFn>(GetProcAddress(engine, "CreateInterface")) : nullptr;
-  manager_ = create ? static_cast<IGameEventManager2*>(create("GAMEEVENTSMANAGER002", nullptr)) : nullptr;
-  if (!manager_) { EventLog("GAMEEVENTSMANAGER002 factory unavailable; waiting for CGameEventManager_Init"); poll(); return true; }
-  attach_legacy_manager(manager_);
+  auto* client_manager = create ? static_cast<IGameEventManager2*>(create("GAMEEVENTSMANAGER002", nullptr)) : nullptr;
+  // Current CS2 no longer publishes GAMEEVENTSMANAGER002 from engine2.dll.
+  // client.dll still owns a CGameEventManager singleton, so recover the same
+  // pointer from its CGameEventManager_Init caller, as we already do for the
+  // local server manager.
+  if (!client_manager) {
+    HMODULE client = GetModuleHandleW(L"client.dll");
+    static const int client_init_sig[] = {
+        0x40,0x53,0x48,0x83,0xEC,-1,0x48,0x8B,0x01,
+        0x48,0x8B,0xD9,0xFF,0x50,-1,0x48,0x8B,0x03};
+    void* client_init = PatternScan(client, client_init_sig,
+        sizeof(client_init_sig) / sizeof(client_init_sig[0]));
+    client_manager = RecoverExistingManager(client, client_init);
+    if (client_manager)
+      EventLog("recovered existing client IGameEventManager2 from client.dll global");
+    else if (!client)
+      EventLog("client.dll is not loaded");
+    else if (!client_init)
+      EventLog("client CGameEventManager_Init signature not found");
+    else
+      EventLog("client IGameEventManager2 global is not initialized");
+  }
+  if (client_manager) {
+    attach_client_manager(client_manager);
+  } else {
+    EventLog("client game event manager unavailable");
+  }
+  // Also recover the server.dll manager for locally hosted practice maps.
+  // Official matchmaking never runs its authoritative server in this process,
+  // so its player_hurt event is received only by the client-side listener above.
+  poll();
   return true;
 }
 
 void GameEventBridge::attach_legacy_manager(IGameEventManager2* manager) {
-  if (!manager || (manager_ == manager && listener_)) return;
-  manager_ = manager;
-  // Listener dispatch is sufficient once the real manager has been recovered.
-  // Avoid detouring FireEvent: its ABI changed in CS2 and a mismatched detour
-  // can corrupt registers when the first event is fired.
-  if (listener_) { delete listener_; listener_=nullptr; }
-  listener_ = new Listener(*this);
-  // The recovered manager belongs to server.dll, so this must be registered
-  // as a server-side listener. Registering with false succeeds but never
-  // receives the locally hosted server's player_hurt dispatch.
-  if (!manager_->AddListener(listener_, "player_hurt", true)) {
-    delete listener_; listener_ = nullptr; manager_ = nullptr;
-    EventLog("AddListener(player_hurt) failed"); return;
+  attach_server_manager(manager);
+}
+
+void GameEventBridge::attach_client_manager(IGameEventManager2* manager) {
+  if (!manager || (client_manager_ == manager && client_listener_)) return;
+  if (client_manager_ && client_listener_) client_manager_->RemoveListener(client_listener_);
+  delete client_listener_;
+  client_listener_ = nullptr;
+  client_manager_ = manager;
+
+  client_listener_ = new Listener(*this);
+  // Networked official-server events are client-side events. The previous
+  // implementation passed true here, which only worked for a local server.
+  if (!client_manager_->AddListener(client_listener_, "player_hurt", false)) {
+    delete client_listener_; client_listener_ = nullptr; client_manager_ = nullptr;
+    EventLog("client AddListener(player_hurt, false) failed"); return;
   }
-  EventLog(manager_->FindListener(listener_, "player_hurt")
-      ? "player_hurt server-side listener registered and verified"
-      : "player_hurt AddListener returned success but FindListener failed");
-  const bool chat_server = manager_->AddListener(listener_, "player_chat", true);
-  const bool chat_client = manager_->AddListener(listener_, "player_chat", false);
-  const bool say_server = manager_->AddListener(listener_, "player_say", true);
-  const bool say_client = manager_->AddListener(listener_, "player_say", false);
-  char chat_status[160]{};
-  std::snprintf(chat_status, sizeof(chat_status),
-      "chat listeners: player_chat server=%d client=%d, player_say server=%d client=%d",
-      chat_server, chat_client, say_server, say_client);
-  EventLog(chat_status);
+  EventLog(client_manager_->FindListener(client_listener_, "player_hurt")
+      ? "player_hurt client-side listener registered and verified"
+      : "client player_hurt AddListener succeeded but FindListener failed");
+
+  const bool chat = client_manager_->AddListener(client_listener_, "player_chat", false);
+  const bool say = client_manager_->AddListener(client_listener_, "player_say", false);
+  char status[128]{};
+  std::snprintf(status, sizeof(status),
+      "client chat listeners: player_chat=%d player_say=%d", chat, say);
+  EventLog(status);
+
+  // SourceMod and CounterStrikeSharp hook IGameEventManager2::FireEvent rather
+  // than relying only on an IGameEventListener2.  Do the same on the client
+  // manager: network events enter this path before listener filtering.  The
+  // Source SDK GAMEEVENTSMANAGER002 layout places FireEvent at vtable slot 7.
+  if (!g_fire_target) {
+    auto*** object = reinterpret_cast<void***>(client_manager_);
+    void** table = object ? *object : nullptr;
+    void* candidate = table ? table[7] : nullptr; // IGameEventManager2::FireEvent
+    MEMORY_BASIC_INFORMATION mbi{};
+    const bool executable = candidate && VirtualQuery(candidate, &mbi, sizeof(mbi)) &&
+        mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+        ((mbi.Protect & 0xff) == PAGE_EXECUTE ||
+         (mbi.Protect & 0xff) == PAGE_EXECUTE_READ ||
+         (mbi.Protect & 0xff) == PAGE_EXECUTE_READWRITE ||
+         (mbi.Protect & 0xff) == PAGE_EXECUTE_WRITECOPY);
+    if (executable) {
+      MH_Initialize();
+      if (MH_CreateHook(candidate, HookFireEvent,
+            reinterpret_cast<void**>(&g_original_fire)) == MH_OK &&
+          (MH_EnableHook(candidate) == MH_OK || MH_EnableHook(candidate) == MH_ERROR_ENABLED)) {
+        g_fire_target = candidate;
+        EventLog("FireEvent vtable[7] hook installed");
+      } else {
+        EventLog("FireEvent vtable[7] hook failed");
+      }
+    } else {
+      EventLog("FireEvent vtable[7] is not executable");
+    }
+  }
+
+  // Keep FireEventClientSide as a second observation point. Some engine paths
+  // bypass FireEvent and dispatch an already-decoded local event directly.
+  if (!g_fire_client_target) {
+    auto*** object = reinterpret_cast<void***>(client_manager_);
+    void** table = object ? *object : nullptr;
+    void* candidate = table ? table[8] : nullptr; // IGameEventManager2::FireEventClientSide
+    MEMORY_BASIC_INFORMATION mbi{};
+    const bool executable = candidate && VirtualQuery(candidate, &mbi, sizeof(mbi)) &&
+        mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+        ((mbi.Protect & 0xff) == PAGE_EXECUTE ||
+         (mbi.Protect & 0xff) == PAGE_EXECUTE_READ ||
+         (mbi.Protect & 0xff) == PAGE_EXECUTE_READWRITE ||
+         (mbi.Protect & 0xff) == PAGE_EXECUTE_WRITECOPY);
+    if (executable) {
+      MH_Initialize();
+      if (MH_CreateHook(candidate, HookFireEventClient,
+            reinterpret_cast<void**>(&g_original_fire_client)) == MH_OK &&
+          (MH_EnableHook(candidate) == MH_OK || MH_EnableHook(candidate) == MH_ERROR_ENABLED)) {
+        g_fire_client_target = candidate;
+        EventLog("FireEventClientSide vtable[8] hook installed");
+      } else {
+        EventLog("FireEventClientSide vtable[8] hook failed");
+      }
+    } else {
+      EventLog("FireEventClientSide vtable[8] is not executable");
+    }
+  }
+}
+
+void GameEventBridge::attach_server_manager(IGameEventManager2* manager) {
+  if (!manager || manager == client_manager_ || (server_manager_ == manager && server_listener_)) return;
+  if (server_manager_ && server_listener_) server_manager_->RemoveListener(server_listener_);
+  delete server_listener_;
+  server_listener_ = nullptr;
+  server_manager_ = manager;
+
+  server_listener_ = new Listener(*this);
+  if (!server_manager_->AddListener(server_listener_, "player_hurt", true)) {
+    delete server_listener_; server_listener_ = nullptr; server_manager_ = nullptr;
+    EventLog("server AddListener(player_hurt, true) failed"); return;
+  }
+  EventLog(server_manager_->FindListener(server_listener_, "player_hurt")
+      ? "player_hurt local-server listener registered and verified"
+      : "server player_hurt AddListener succeeded but FindListener failed");
 }
 
 void GameEventBridge::poll() {
@@ -206,7 +349,7 @@ void GameEventBridge::poll() {
     chat_lines.swap(pending_chat_lines_);
   }
   for (const auto& line : chat_lines) dispatch_console_line(line);
-  if (manager_ || g_manager_init_target) return;
+  if (server_manager_ || g_manager_init_target) return;
   HMODULE server = GetModuleHandleW(L"server.dll");
   if (!server) return;
   static const int sig[] = {0x40,0x53,0x48,0x83,0xEC,-1,0x48,0x8B,0x01,0x48,0x8B,0xD9,0xFF,0x50,-1,0x48,0x8B,0x03};
@@ -216,23 +359,11 @@ void GameEventBridge::poll() {
   //   mov rcx, qword ptr [rip + global_manager]
   //   call CGameEventManager_Init
   // This works even when the DLL is injected after server initialization.
-  auto* base = reinterpret_cast<unsigned char*>(server);
-  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-  const size_t image_size = nt->OptionalHeader.SizeOfImage;
-  for (size_t i=7; i+5<=image_size; ++i) {
-    if (base[i] != 0xE8 || base[i-7] != 0x48 || base[i-6] != 0x8B || base[i-5] != 0x0D) continue;
-    const auto call_disp = *reinterpret_cast<int32_t*>(base+i+1);
-    if (base+i+5+call_disp != g_manager_init_target) continue;
-    const auto global_disp = *reinterpret_cast<int32_t*>(base+i-4);
-    auto** global_slot = reinterpret_cast<IGameEventManager2**>(base+i+global_disp);
-    // RIP after mov is base+i, because the mov starts at i-7 and is 7 bytes.
-    if (global_slot && *global_slot) {
-      EventLog("recovered existing IGameEventManager2 from server global");
-      g_manager_init_target = nullptr;
-      attach_legacy_manager(*global_slot);
-      return;
-    }
+  if (auto* existing = RecoverExistingManager(server, g_manager_init_target)) {
+    EventLog("recovered existing IGameEventManager2 from server global");
+    g_manager_init_target = nullptr;
+    attach_legacy_manager(existing);
+    return;
   }
   MH_Initialize();
   if (MH_CreateHook(g_manager_init_target, HookManagerInit, reinterpret_cast<void**>(&g_original_manager_init)) == MH_OK &&
@@ -242,14 +373,17 @@ void GameEventBridge::poll() {
 }
 
 void GameEventBridge::shutdown() {
-  if (manager_ && listener_) manager_->RemoveListener(listener_);
+  if (client_manager_ && client_listener_) client_manager_->RemoveListener(client_listener_);
+  if (server_manager_ && server_listener_) server_manager_->RemoveListener(server_listener_);
   if (g_fire_target) { MH_DisableHook(g_fire_target); MH_RemoveHook(g_fire_target); g_fire_target = nullptr; }
   if (g_fire_client_target) { MH_DisableHook(g_fire_client_target); MH_RemoveHook(g_fire_client_target); g_fire_client_target = nullptr; }
   if (g_manager_init_target) { MH_DisableHook(g_manager_init_target); MH_RemoveHook(g_manager_init_target); g_manager_init_target=nullptr; }
   if (g_conmsg_target) { MH_DisableHook(g_conmsg_target); MH_RemoveHook(g_conmsg_target); g_conmsg_target=nullptr; }
   if (g_msg_target) { MH_DisableHook(g_msg_target); MH_RemoveHook(g_msg_target); g_msg_target=nullptr; }
   g_bridge = nullptr;
-  delete listener_; listener_ = nullptr; manager_ = nullptr; lua_ = nullptr;
+  delete client_listener_; client_listener_ = nullptr; client_manager_ = nullptr;
+  delete server_listener_; server_listener_ = nullptr; server_manager_ = nullptr;
+  lua_ = nullptr;
 }
 
 void GameEventBridge::on_console_line(const char* line) {
@@ -296,7 +430,28 @@ void GameEventBridge::on_game_event(IGameEvent* event) {
   if (lstrcmpiA(name, "player_hurt") != 0) return;
   const GameEventKeySymbol userid("userid"), attacker("attacker"), health("health"), armor("armor"),
       dmg_health("dmg_health"), dmg_armor("dmg_armor"), hitgroup("hitgroup"), weapon("weapon");
-  lua_->fire_player_hurt(event->GetInt(userid), event->GetInt(attacker),
-    event->GetInt(health), event->GetInt(armor), event->GetInt(dmg_health),
-    event->GetInt(dmg_armor), event->GetInt(hitgroup), event->GetString(weapon));
+  const int victim = event->GetInt(userid);
+  const int source = event->GetInt(attacker);
+  const int remaining = event->GetInt(health);
+  const int damage = event->GetInt(dmg_health);
+  const int group = event->GetInt(hitgroup);
+
+  // A listen server can forward the same event through both managers. Collapse
+  // the duplicate while preserving genuinely separate pellet/multi-hit events.
+  const uint64_t time = GetTickCount64();
+  {
+    std::lock_guard lock(hurt_mutex_);
+    if (time - last_hurt_time_ <= 15 && victim == last_hurt_userid_ &&
+        source == last_hurt_attacker_ && remaining == last_hurt_health_ &&
+        damage == last_hurt_damage_ && group == last_hurt_hitgroup_) return;
+    last_hurt_time_ = time;
+    last_hurt_userid_ = victim;
+    last_hurt_attacker_ = source;
+    last_hurt_health_ = remaining;
+    last_hurt_damage_ = damage;
+    last_hurt_hitgroup_ = group;
+  }
+
+  lua_->fire_player_hurt(victim, source, remaining, event->GetInt(armor), damage,
+    event->GetInt(dmg_armor), group, event->GetString(weapon));
 }
