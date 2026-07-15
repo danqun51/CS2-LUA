@@ -29,6 +29,7 @@
 支付宝;
 
 <img width="539" height="576" alt="qq_pic_merged_1784118561238" src="https://github.com/user-attachments/assets/bfda7794-d1db-4ef4-8b71-3a6085f0bb6f" />
+
 微信；
 
 <img width="1037" height="1037" alt="mm_reward_qrcode_1707032519024" src="https://github.com/user-attachments/assets/2b4753c0-95f7-4a39-99ce-dc20ed76c823" />
