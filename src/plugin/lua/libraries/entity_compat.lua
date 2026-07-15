@@ -92,20 +92,33 @@ local function from_handle(handle)
   if index==0 or index==0x7fff then return nil end
   return raw_entity(index),index
 end
-local function wrap(p,index,kind,controller)
+local function wrap(p,index,kind,controller,pawn_index)
   if not p then return nil end
-  return setmetatable({_ptr=p,_index=index or 0,_kind=kind or 'entity',_controller=controller},mt)
+  return setmetatable({_ptr=p,_index=index or 0,_kind=kind or 'entity',
+    _controller=controller,_pawn_index=pawn_index},mt)
 end
 local function vec(p,n) local v=read(p,n,'cs2lua_vec3_t'); return v and vector(v.x,v.y,v.z) or vector() end
 local function node(self) return ptr(self._ptr,cfg().base.m_pGameSceneNode) end
 local function pawn(controller,index)
   local p,i=from_handle(read(controller,cfg().controller.m_hPlayerPawn,'uint32_t'))
-  return wrap(p,i,'player',wrap(controller,index,'controller'))
+  -- Neverlose exposes the logical player/controller index through get_index(),
+  -- not Source 2's unrelated pawn entity index. Keep the pawn pointer for all
+  -- player methods and retain its real index internally.
+  return wrap(p,index,'player',wrap(controller,index,'controller'),i)
 end
 
 function entity.get(index,by_userid)
   index=tonumber(index); if not index then return nil end
-  if by_userid then index=index%0x8000 end
+  if by_userid then
+    -- Current CS2 legacy events expose a zero-based player userid/slot
+    -- (0..63), while controller entities occupy indices 1..64. Resolve
+    -- userid + 1 -> controller -> pawn, but preserve the zero-based userid as
+    -- the public Neverlose-compatible get_index() value.
+    index=index%0x8000
+    if index==0x7fff or index>63 then return nil end
+    local controller=raw_entity(index+1)
+    return controller and pawn(controller,index) or nil
+  end
   return wrap(raw_entity(index),index)
 end
 function entity.get_local_player()
@@ -150,8 +163,9 @@ function entity.get_local_player()
       if raw_entity(i)==pawn_pointer then pawn_index=i; break end
     end
   end
-  return wrap(pawn_pointer,pawn_index or 0,'player',
-    controller and wrap(controller,controller_index,'controller') or nil)
+  local public_index=controller_index~=0 and (controller_index-1) or (pawn_index or 0)
+  return wrap(pawn_pointer,public_index,'player',
+    controller and wrap(controller,public_index,'controller') or nil,pawn_index)
 end
 function entity.debug_status()
   local b=base()
@@ -194,7 +208,7 @@ end
 function entity.get_players(enemies_only,include_dormant,callback)
   local result={}
   for i=1,64 do
-    local c=raw_entity(i); local e=c and pawn(c,i)
+    local c=raw_entity(i); local e=c and pawn(c,i-1)
     if e and (include_dormant or not e:is_dormant()) and (not enemies_only or e:is_enemy()) then
       if callback then callback(e) else result[#result+1]=e end
     end
