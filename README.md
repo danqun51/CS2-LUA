@@ -21,3 +21,11 @@
 # 支持和NL同时注入
 
 <img width="1635" height="1027" alt="03461dc2c684ff5b506600c20a30c04a" src="https://github.com/user-attachments/assets/a194216b-6314-4662-adb1-faa0f762c50e" />
+
+# 支持与赞助
+
+你的赞助是对这个项目最大的支持，赞助后支持定制你需要的LUA或者更新新的功能
+支付宝;
+<img width="539" height="576" alt="qq_pic_merged_1784118561238" src="https://github.com/user-attachments/assets/bfda7794-d1db-4ef4-8b71-3a6085f0bb6f" />
+微信；
+<img width="1037" height="1037" alt="mm_reward_qrcode_1707032519024" src="https://github.com/user-attachments/assets/2b4753c0-95f7-4a39-99ce-dc20ed76c823" />
