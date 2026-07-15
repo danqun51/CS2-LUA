@@ -20,4 +20,4 @@
 
 # 支持和NL同时注入
 
-![Uploading 03461dc2c684ff5b506600c20a30c04a.png…]()
+<img width="1635" height="1027" alt="03461dc2c684ff5b506600c20a30c04a" src="https://github.com/user-attachments/assets/a194216b-6314-4662-adb1-faa0f762c50e" />
