@@ -58,16 +58,6 @@ add_library(imgui_static STATIC
 target_include_directories(imgui_static PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui_static PUBLIC d3d11 dxgi dwmapi)
 
-add_executable(CS2LuaInjector WIN32
-  src/injector/main.cpp
-  src/injector/hexsync_client.cpp
-  src/injector/hexsync_client.hpp
-  src/injector/driver_service.cpp
-  src/injector/driver_service.hpp
-)
-target_compile_definitions(CS2LuaInjector PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(CS2LuaInjector PRIVATE imgui_static advapi32 d3d11 dxgi dwmapi)
-
 set(CS2LUA_EMBEDDED_LIBRARIES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/lua/libraries/nl_compat.lua
   ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/lua/libraries/offsets.lua
@@ -107,6 +97,30 @@ add_library(CS2LuaPlugin SHARED
 target_compile_definitions(CS2LuaPlugin PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(CS2LuaPlugin PRIVATE src/plugin)
 target_link_libraries(CS2LuaPlugin PRIVATE lua_static imgui_static minhook d3d11 dxgi user32 winhttp)
+
+# Build the injector after the plugin and embed both runtime payloads directly
+# into the executable. They are extracted to a private temporary directory only
+# for the duration of injection, so the distributed package is a single EXE.
+set(CS2LUA_DRIVER_PAYLOAD "${CMAKE_CURRENT_SOURCE_DIR}/CS2HexSyncCompatDriver.sys")
+set(CS2LUA_PLUGIN_PAYLOAD "${CMAKE_BINARY_DIR}/$<CONFIG>/CS2LuaPlugin.dll")
+file(GENERATE
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/$<CONFIG>/injector_payloads.rc"
+  CONTENT "#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/injector/injector_resources.h\"\nIDR_CS2LUA_DRIVER RCDATA \"${CS2LUA_DRIVER_PAYLOAD}\"\nIDR_CS2LUA_PLUGIN RCDATA \"${CS2LUA_PLUGIN_PAYLOAD}\"\n"
+)
+
+add_executable(CS2LuaInjector WIN32
+  src/injector/main.cpp
+  src/injector/hexsync_client.cpp
+  src/injector/hexsync_client.hpp
+  src/injector/driver_service.cpp
+  src/injector/driver_service.hpp
+  src/injector/injector_resources.h
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/$<CONFIG>/injector_payloads.rc"
+)
+add_dependencies(CS2LuaInjector CS2LuaPlugin)
+target_compile_definitions(CS2LuaInjector PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(CS2LuaInjector PRIVATE imgui_static advapi32 d3d11 dxgi dwmapi shell32)
+target_link_options(CS2LuaInjector PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
 
 
 
