@@ -14,6 +14,7 @@
 #include "imgui_impl_win32.h"
 #include "hexsync_client.hpp"
 #include "driver_service.hpp"
+#include "injector_resources.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -31,11 +32,8 @@ static IDXGISwapChain* g_pSwapChain = nullptr;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 
 static std::vector<std::string> g_logs;
-static char g_target[260] = "cs2.exe";
-static char g_dll[MAX_PATH] = "";
-static char g_hexsync_status[512] = "not checked";
-static char g_driver_path[MAX_PATH] = "D:\\\\Documents\\\\CS2 LUA\\\\CS2-Lua-Plugin-Skeleton\\\\CS2HexSyncCompatDriver.sys";
-static char g_driver_service[128] = "HexSyncService";
+constexpr wchar_t kTargetProcess[] = L"cs2.exe";
+constexpr wchar_t kDriverService[] = L"HexSyncService";
 
 void ApplyNeverloseStyle() {
     auto& s = ImGui::GetStyle();
@@ -63,13 +61,58 @@ void Log(const char* fmt, ...) {
     g_logs.emplace_back(buf);
 }
 
-std::wstring Utf8ToWide(const char* s) {
-    if (!s || !*s) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
-    std::wstring out(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s, -1, out.data(), len);
-    while (!out.empty() && out.back() == L'\0') out.pop_back();
-    return out;
+bool ExtractResource(WORD id, const std::filesystem::path& output) {
+    HRSRC resource = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!resource) { Log("[-] FindResource(%u) failed: %lu", id, GetLastError()); return false; }
+    HGLOBAL loaded = LoadResource(nullptr, resource);
+    const DWORD size = SizeofResource(nullptr, resource);
+    const void* bytes = loaded ? LockResource(loaded) : nullptr;
+    if (!bytes || !size) { Log("[-] resource %u is empty", id); return false; }
+
+    std::error_code ec;
+    std::filesystem::create_directories(output.parent_path(), ec);
+    HANDLE file = CreateFileW(output.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        Log("[-] create embedded payload failed: %lu", GetLastError());
+        return false;
+    }
+    DWORD written = 0;
+    const BOOL ok = WriteFile(file, bytes, size, &written, nullptr);
+    CloseHandle(file);
+    if (!ok || written != size) {
+        Log("[-] write embedded payload failed: %lu", GetLastError());
+        DeleteFileW(output.c_str());
+        return false;
+    }
+    return true;
+}
+
+struct PayloadPaths {
+    std::filesystem::path directory;
+    std::filesystem::path dll;
+    std::filesystem::path driver;
+};
+
+bool PreparePayloads(bool with_driver, PayloadPaths& paths) {
+    wchar_t temp[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, temp)) { Log("[-] GetTempPathW failed: %lu", GetLastError()); return false; }
+    paths.directory = std::filesystem::path(temp) /
+        (L"CS2LuaInjector-" + std::to_wstring(GetCurrentProcessId()));
+    paths.dll = paths.directory / L"CS2LuaPlugin.dll";
+    paths.driver = paths.directory / L"CS2HexSyncCompatDriver.sys";
+    if (!ExtractResource(IDR_CS2LUA_PLUGIN, paths.dll)) return false;
+    if (with_driver && !ExtractResource(IDR_CS2LUA_DRIVER, paths.driver)) return false;
+    return true;
+}
+
+void CleanupPayloads(const PayloadPaths& paths, bool with_driver) {
+    if (with_driver) DeleteFileW(paths.driver.c_str());
+    // A loaded DLL remains mapped by cs2.exe. Ask Windows to remove the
+    // temporary extraction on reboot if it cannot be deleted immediately.
+    if (!DeleteFileW(paths.dll.c_str())) MoveFileExW(paths.dll.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    std::error_code ec;
+    std::filesystem::remove(paths.directory, ec);
 }
 
 DWORD FindProcessByName(const wchar_t* name) {
@@ -84,6 +127,20 @@ DWORD FindProcessByName(const wchar_t* name) {
     }
     CloseHandle(snap);
     return pid;
+}
+
+bool IsModuleLoaded(DWORD pid, const wchar_t* module_name) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32W module{sizeof(module)};
+    bool found = false;
+    if (Module32FirstW(snap, &module)) {
+        do {
+            if (_wcsicmp(module.szModule, module_name) == 0) { found = true; break; }
+        } while (Module32NextW(snap, &module));
+    }
+    CloseHandle(snap);
+    return found;
 }
 
 bool EnableDebugPrivilege() {
@@ -150,53 +207,37 @@ bool InjectLoadLibrary(HANDLE hp, const std::wstring& dllPath) {
     return true;
 }
 
-bool InjectFromUi() {
-    const std::wstring target = Utf8ToWide(g_target);
-    std::wstring dll = Utf8ToWide(g_dll);
-    if (target.empty()) { Log("[-] target empty"); return false; }
-    if (dll.empty()) {
-        wchar_t exe[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        dll = (std::filesystem::path(exe).parent_path() / L"CS2LuaPlugin.dll").wstring();
-    }
-    dll = std::filesystem::absolute(dll).wstring();
-    if (!std::filesystem::exists(dll)) { Log("[-] DLL not found"); return false; }
-
+bool NormalInject() {
+    PayloadPaths payloads;
+    if (!PreparePayloads(false, payloads)) return false;
     EnableDebugPrivilege();
-    DWORD pid = FindProcessByName(target.c_str());
-    if (!pid) { Log("[-] process not found: %s", g_target); return false; }
-    Log("[*] target %s PID = %lu", g_target, pid);
+    DWORD pid = FindProcessByName(kTargetProcess);
+    if (!pid) { Log("[-] cs2.exe not found"); CleanupPayloads(payloads, false); return false; }
+    Log("[*] target cs2.exe PID = %lu", pid);
 
     HANDLE hp = OpenTargetProcess(pid);
-    if (!hp) return false;
-    bool ok = InjectLoadLibrary(hp, dll);
+    if (!hp) { CleanupPayloads(payloads, false); return false; }
+    bool ok = InjectLoadLibrary(hp, payloads.dll.wstring());
     CloseHandle(hp);
+    CleanupPayloads(payloads, false);
     Log(ok ? "[+] injection finished" : "[-] injection failed");
     return ok;
 }
-bool ScopedDriverKernelInject() {
-    const std::wstring target = Utf8ToWide(g_target);
-    std::wstring dll = Utf8ToWide(g_dll);
-    std::wstring sys = Utf8ToWide(g_driver_path);
-    std::wstring svc = Utf8ToWide(g_driver_service);
-    if (target.empty() || sys.empty() || svc.empty()) { Log("[-] target/sys/service empty"); return false; }
-    if (dll.empty()) {
-        wchar_t exe[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        dll = (std::filesystem::path(exe).parent_path() / L"CS2LuaPlugin.dll").wstring();
-    }
-    dll = std::filesystem::absolute(dll).wstring();
-    sys = std::filesystem::absolute(sys).wstring();
-    if (!std::filesystem::exists(dll)) { Log("[-] DLL not found"); return false; }
-    if (!std::filesystem::exists(sys)) { Log("[-] driver sys not found: %s", g_driver_path); return false; }
-
-    DWORD pid = FindProcessByName(target.c_str());
-    if (!pid) { Log("[-] process not found: %s", g_target); return false; }
+bool DriverInject() {
+    PayloadPaths payloads;
+    if (!PreparePayloads(true, payloads)) return false;
+    DWORD pid = FindProcessByName(kTargetProcess);
+    if (!pid) { Log("[-] cs2.exe not found"); CleanupPayloads(payloads, true); return false; }
 
     DriverServiceManager sm;
-    Log("[*] installing/starting driver service: %s", g_driver_service);
-    if (!sm.install_and_start(svc.c_str(), sys.c_str())) {
+    // Remove any stale registration from an interrupted previous run before
+    // installing the embedded driver image.
+    sm.stop_and_delete(kDriverService);
+    Log("[*] installing and starting embedded driver");
+    if (!sm.install_and_start(kDriverService, payloads.driver.c_str())) {
         Log("[-] driver start failed: %s", sm.last_error().c_str());
+        sm.stop_and_delete(kDriverService);
+        CleanupPayloads(payloads, true);
         return false;
     }
 
@@ -213,17 +254,31 @@ bool ScopedDriverKernelInject() {
         Log("[-] HexSync SELF_TEST failed after start: %s", hx.last_error().c_str());
     } else {
         Log("[+] HexSync online, magic=0x%llX", hx.magic());
-        Log("[*] kernel inject pid=%lu dll=%ls", pid, dll.c_str());
-        injected = hx.inject_loadlibrary(pid, dll);
+        Log("[*] driver inject PID=%lu", pid);
+        injected = hx.inject_loadlibrary(pid, payloads.dll.wstring());
+        if (injected) {
+            // The driver creates the remote thread asynchronously. Keep the
+            // extracted DLL alive until LoadLibrary has actually mapped it.
+            bool loaded = false;
+            for (int i = 0; i < 50; ++i) {
+                if (IsModuleLoaded(pid, L"CS2LuaPlugin.dll")) { loaded = true; break; }
+                Sleep(100);
+            }
+            if (!loaded) {
+                injected = false;
+                Log("[-] remote thread returned but CS2LuaPlugin.dll was not loaded");
+            }
+        }
         Log(injected ? "[+] kernel injection finished" : "[-] kernel injection failed: %s", hx.last_error().c_str());
     }
 
-    Log("[*] stopping/deleting driver service: %s", g_driver_service);
-    if (!sm.stop_and_delete(svc.c_str())) {
+    Log("[*] stopping and deleting driver service");
+    if (!sm.stop_and_delete(kDriverService)) {
         Log("[-] driver cleanup failed: %s", sm.last_error().c_str());
     } else {
         Log("[+] driver service cleaned up");
     }
+    CleanupPayloads(payloads, true);
     return injected;
 }
 
@@ -283,70 +338,16 @@ void RenderUi() {
     ImGui::Begin("CS2 Lua Injector", nullptr,
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
-    ImGui::TextUnformatted("CS2 Lua Plugin Injector");
+    ImGui::TextUnformatted("CS2 Lua One-Click Injector");
     ImGui::Separator();
-    ImGui::InputText("Target process", g_target, IM_ARRAYSIZE(g_target));
-    ImGui::InputText("Plugin DLL", g_dll, IM_ARRAYSIZE(g_dll));
-    ImGui::SameLine();
-    if (ImGui::Button("Default")) {
-        char exe[MAX_PATH]{};
-        GetModuleFileNameA(nullptr, exe, MAX_PATH);
-        auto path = std::filesystem::path(exe).parent_path() / "CS2LuaPlugin.dll";
-        strncpy_s(g_dll, path.string().c_str(), _TRUNCATE);
-    }
-    ImGui::TextWrapped("Injection method: loadlib from CS2-P2C-TEMPLATES-main / CS2UnifiedInjector style");
+    ImGui::TextUnformatted("Target: cs2.exe");
+    ImGui::TextUnformatted("CS2LuaPlugin.dll and HexSync driver are embedded.");
+    ImGui::Spacing();
 
-    ImGui::SeparatorText("HexSync driver probe");
-    ImGui::TextWrapped("Device: \\\\.\\HexSyncService / IOCTL SELF_TEST only");
-    if (ImGui::Button("Check HexSync driver", ImVec2(180, 0))) {
-        HexSyncClient hx;
-        if (hx.self_test()) {
-            snprintf(g_hexsync_status, sizeof(g_hexsync_status), "online, magic=0x%llX", hx.magic());
-            Log("[+] HexSync driver online, SELF_TEST magic=0x%llX", hx.magic());
-        } else {
-            snprintf(g_hexsync_status, sizeof(g_hexsync_status), "offline/error: %s", hx.last_error().c_str());
-            Log("[-] HexSync driver check failed: %s", hx.last_error().c_str());
-        }
-    }
+    const float width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+    if (ImGui::Button("Driver Inject", ImVec2(width, 52))) DriverInject();
     ImGui::SameLine();
-    ImGui::TextUnformatted(g_hexsync_status);
-    ImGui::InputText("Driver .sys", g_driver_path, IM_ARRAYSIZE(g_driver_path));
-    ImGui::InputText("Service name", g_driver_service, IM_ARRAYSIZE(g_driver_service));
-
-    if (ImGui::Button("Install driver", ImVec2(145, 0))) {
-        DriverServiceManager sm;
-        const auto sys = Utf8ToWide(g_driver_path);
-        const auto svc = Utf8ToWide(g_driver_service);
-        if (sys.empty() || svc.empty()) Log("[-] driver path/service name empty");
-        else if (!std::filesystem::exists(sys)) Log("[-] driver sys not found: %s", g_driver_path);
-        else if (sm.install(svc.c_str(), std::filesystem::absolute(sys).c_str())) Log("[+] driver service installed: %s", g_driver_service);
-        else Log("[-] install driver failed: %s", sm.last_error().c_str());
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Load driver", ImVec2(145, 0))) {
-        DriverServiceManager sm;
-        const auto svc = Utf8ToWide(g_driver_service);
-        if (svc.empty()) Log("[-] service name empty");
-        else if (sm.start(svc.c_str())) {
-            HexSyncClient hx;
-            if (hx.self_test()) Log("[+] driver loaded, SELF_TEST magic=0x%llX", hx.magic());
-            else Log("[+] service started, but device probe failed: %s", hx.last_error().c_str());
-        } else Log("[-] load driver failed: %s", sm.last_error().c_str());
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Unload driver", ImVec2(145, 0))) {
-        DriverServiceManager sm;
-        const auto svc = Utf8ToWide(g_driver_service);
-        if (svc.empty()) Log("[-] service name empty");
-        else if (sm.stop(svc.c_str())) Log("[+] driver unloaded; service registration retained");
-        else Log("[-] unload driver failed: %s", sm.last_error().c_str());
-    }
-
-    if (ImGui::Button("Inject", ImVec2(120, 0))) InjectFromUi();
-    ImGui::SameLine();
-    if (ImGui::Button("Load driver -> kernel inject -> unload", ImVec2(300, 0))) ScopedDriverKernelInject();
-    ImGui::SameLine();
-    if (ImGui::Button("Clear log", ImVec2(120, 0))) g_logs.clear();
+    if (ImGui::Button("Normal Inject", ImVec2(width, 52))) NormalInject();
 
     ImGui::Separator();
     ImGui::BeginChild("log", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
@@ -384,7 +385,8 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     WNDCLASSEXW wc{ sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, nullptr, nullptr, nullptr, nullptr, L"CS2LuaInjectorWindow", nullptr };
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"CS2 Lua Injector", WS_OVERLAPPEDWINDOW, 100, 100, 860, 560, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"CS2 Lua Injector", WS_OVERLAPPEDWINDOW,
+                              100, 100, 660, 420, nullptr, nullptr, wc.hInstance, nullptr);
     if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -400,7 +402,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     Log("[*] ready");
-    Log("[*] default DLL: same directory as injector / CS2LuaPlugin.dll");
+    Log("[*] embedded target: cs2.exe");
 
     bool done = false;
     while (!done) {

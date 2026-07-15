@@ -47,7 +47,9 @@ local function global_ptr(name,offset)
 end
 local layout={stride=0x78,pointer_offset=0,resolved=false,validated=false}
 local function resolve_layout()
-  if layout.resolved then return end
+  -- Do not permanently cache a failed lobby/loading-screen resolution.  The
+  -- entity list and local pawn do not exist yet there; retry after map entry.
+  if layout.validated then return end
   layout.resolved=true
   local list=global_ptr('entity_list',cfg().dwEntityList)
   local controller=global_ptr('local_controller',cfg().dwLocalPlayerController)
@@ -107,23 +109,49 @@ function entity.get(index,by_userid)
   return wrap(raw_entity(index),index)
 end
 function entity.get_local_player()
-  local b=base(); local local_pointer=b and ptr(b,cfg().dwLocalPlayerPawn) or nil
-  -- During map transitions the pawn global can temporarily be null while the
-  -- local controller already owns a valid pawn handle.
-  if not local_pointer and b then
-    local controller=global_ptr('local_controller',cfg().dwLocalPlayerController)
-    if controller then local_pointer=from_handle(read(controller,cfg().controller.m_hPlayerPawn,'uint32_t')) end
+  local b=base()
+  if not b then return nil end
+
+  -- Resolve all values on every call. Only addresses/entry layout are cached;
+  -- controller, handle and pawn pointers are deliberately never cached because
+  -- CS2 replaces/clears them on connect, disconnect and map transitions.
+  resolve_layout()
+  local controller=global_ptr('local_controller',cfg().dwLocalPlayerController)
+  local direct_pawn=ptr(b,cfg().dwLocalPlayerPawn)
+  local pawn_pointer,pawn_index
+  if controller then
+    pawn_pointer,pawn_index=from_handle(read(controller,cfg().controller.m_hPlayerPawn,'uint32_t'))
   end
-  if not local_pointer then return nil end
-  for i=1,64 do
-    local controller=raw_entity(i)
-    if controller then
-      local player=pawn(controller,i)
-      if player and player._ptr==local_pointer then return player end
+  if not pawn_pointer then pawn_pointer=direct_pawn end
+  if not pawn_pointer then return nil end
+
+  -- A disconnected lobby may leave readable old allocations behind. Require
+  -- the current pawn to still have the basic live entity structure.
+  local team=read(pawn_pointer,cfg().base.m_iTeamNum,'uint8_t')
+  local scene=ptr(pawn_pointer,cfg().base.m_pGameSceneNode)
+  local health=read(pawn_pointer,cfg().base.m_iHealth,'int')
+  if not team or team<1 or team>3 or not scene or health==nil or health<0 or health>100 then
+    return nil
+  end
+
+  local controller_index=0
+  if controller then
+    for i=1,64 do
+      if raw_entity(i)==controller then controller_index=i; break end
+    end
+    -- The global still points at the previous map's controller after a
+    -- disconnect for a short time. It is valid only while present in the
+    -- current entity list.
+    if controller_index==0 and not direct_pawn then return nil end
+  end
+
+  if not pawn_index then
+    for i=1,2047 do
+      if raw_entity(i)==pawn_pointer then pawn_index=i; break end
     end
   end
-  for i=1,2047 do if raw_entity(i)==local_pointer then return wrap(local_pointer,i,'player') end end
-  return wrap(local_pointer,0,'player')
+  return wrap(pawn_pointer,pawn_index or 0,'player',
+    controller and wrap(controller,controller_index,'controller') or nil)
 end
 function entity.debug_status()
   local b=base()
