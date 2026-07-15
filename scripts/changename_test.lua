@@ -94,10 +94,8 @@ end
 
 local function set_name(names,name_str)
     if not entity.get_local_player() or entity.get_local_player() =='nil' then
-      print('[等待] 当前尚未建立本地玩家 Pawn；请进入本地地图后 Reload 此测试脚本')
       utils.console_exec('setinfo name "' .. names .. '"')
     else
-      print("游戏中")
       utils.console_exec('setinfo name "' .. name_str .. " " .. names .. '"')
     end
 end
