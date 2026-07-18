@@ -30,6 +30,8 @@
 ```text
 -allow_third_party_software
 ```
+<img width="2056" height="1213" alt="326770c780654d9b2a3f4f0c55ae60db" src="https://github.com/user-attachments/assets/555c974c-d441-4603-a6bf-8486536cbf91" />
+
 
 ## Lua 热键示例
 
@@ -37,7 +39,7 @@
 local group = ui.create("快捷键")
 local hotkey = group:hotkey("开启功能", 0x56) -- V 键
 
-events.render(function()
+events.render:set(function()
     if hotkey:get() then
         -- 热键触发中
     end
