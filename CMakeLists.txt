@@ -95,6 +95,7 @@ add_library(CS2LuaPlugin SHARED
   src/plugin/events/game_events.hpp
 )
 target_compile_definitions(CS2LuaPlugin PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(CS2LuaPlugin PRIVATE /utf-8)
 target_include_directories(CS2LuaPlugin PRIVATE src/plugin)
 target_link_libraries(CS2LuaPlugin PRIVATE lua_static imgui_static minhook d3d11 dxgi user32 winhttp)
 
@@ -119,6 +120,7 @@ add_executable(CS2LuaInjector WIN32
 )
 add_dependencies(CS2LuaInjector CS2LuaPlugin)
 target_compile_definitions(CS2LuaInjector PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(CS2LuaInjector PRIVATE /utf-8)
 target_link_libraries(CS2LuaInjector PRIVATE imgui_static advapi32 d3d11 dxgi dwmapi shell32)
 target_link_options(CS2LuaInjector PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
 

@@ -1,66 +1,97 @@
-﻿# CS2 Lua Plugin Skeleton
+# CS2-LUA 构建与使用说明
 
-本项目是本地学习用骨架：
+## 发布包
 
-- `CS2LuaInjector.exe`：ImGui + DirectX11 桌面 UI 注入器。
-- 注入流程已按 `D:\Documents\CS2 LUA\CS2-P2C-TEMPLATES-main\source\tools\CS2UnifiedInjector\CS2UnifiedInjector.cpp` 的 `loadlib` 分支风格重写：
-  `FindProcessByName -> OpenTargetProcess -> VirtualAllocEx -> WriteProcessMemory -> CreateRemoteThread(LoadLibraryW)`。
-- `CS2LuaPlugin.dll`：在目标进程内启动独立工作线程，初始化 Lua 运行时和菜单状态。
-- `Insert`：插件侧菜单开关热键（当前为框架/日志层，DX11 ImGui hook 预留在 `src/plugin/ui/menu.*`）。
-- `End`：请求卸载插件线程。
-- 用户 Lua 脚本目录：默认读取目标程序同级 `lua/*.lua`。
-- `nl_compat.lua`、`offsets.lua`、`entity_offsets.lua`、`entity_compat.lua`、
-  `panorama_compat.lua` 已作为 RCDATA 资源嵌入 DLL，不需要随 DLL 分发库脚本。
-- Panorama 已改为基于 luv8 source2 的 LuaJIT FFI 实现。接口、V8 包装、
-  特征码、vtable 索引、面板解析和结构偏移全部位于
-  `src/plugin/lua/libraries/panorama_compat.moon`（生成
-  `panorama_compat.lua`）。宿主只提供通用的 `panorama_native.call/defer`
-  owner-thread 调度点，不再由 Present/worker 线程直接进入 V8，也不使用
-  `v8::Locker`。
+`CS2LuaInjector.exe` 是发布给普通用户使用的单文件注入器，其中已经嵌入：
 
+- `CS2LuaPlugin.dll`
+- `CS2HexSyncCompatDriver.sys`
 
-## 构建
+注入时载荷会释放到私有临时目录，完成后自动清理。正常使用不需要把 DLL 和 SYS 放在 EXE 旁边。
 
-需要 Visual Studio 2022 C++ Build Tools + CMake，构建时会拉取 Lua 和 ImGui：
+## 源码构建
+
+需要：
+
+- Windows 10/11 x64
+- Visual Studio 2022，安装“使用 C++ 的桌面开发”
+- CMake 3.24 或更高版本
+- 首次配置时能够访问 GitHub，以获取 LuaJIT、Dear ImGui 和 MinHook
 
 ```powershell
-cd "D:\Documents\CS2 LUA\CS2-Lua-Plugin-Skeleton"
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
+cmake --build build --config Release --target CS2LuaInjector
 ```
 
-
-## 本地运行
-
-1. 启动本地目标进程。
-2. 打开：
-
-```powershell
-.\build\Release\CS2LuaInjector.exe
-```
-
-3. UI 中确认：
-   - `Target process`: `cs2.exe`
-   - `Plugin DLL`: `CS2LuaPlugin.dll` 的绝对路径，或点 `Default` 使用注入器同目录 DLL。
-4. 点击 `Inject`。
-
-DLL 注入后会创建控制台日志。当前插件侧菜单控制已接入脚本管理：
-
-- `Insert`：切换插件菜单状态
-- `F5`：加载脚本
-- `F6`：卸载脚本
-- `F7`：reload scripts
-- `F8`：打印脚本列表
-- `End`：请求卸载工作线程
-
-说明：注入器仍保留本地用户态 `loadlib` 流程。未接入驱动级注入/内核映射分支。`src/plugin/ui/menu.*` 已整理成 ImGui-ready 的菜单模型，后续如接入合法宿主窗口的 DX11 Present hook，可直接把 `F5/F6/F7/F8` 对应逻辑映射到 `ImGui::Button("Load scripts")` / `Unload scripts` / `Reload scripts` / `Script list`。
-
-## 目录
+输出文件：
 
 ```text
-src/injector/          ImGui + DX11 注入器 EXE
-src/plugin/            插件 DLL 主体
-src/plugin/lua/        LuaEngine 与嵌入式 Lua 库（libraries/）
-src/plugin/ui/         MenuController：热键/menu 状态，预留 ImGui DX11 接入点
-scripts/example.lua    示例脚本
+build/Release/CS2LuaInjector.exe
+build/Release/CS2LuaPlugin.dll
 ```
+
+## 使用方法
+
+1. 启动 `cs2.exe`。
+2. 以管理员身份运行 `CS2LuaInjector.exe`。
+3. 确认目标进程后点击“开始注入”。
+4. 等待注入动画完成，按 `Home` 显示或隐藏 Lua 控制中心。
+5. 按 `End` 安全卸载插件。
+
+Lua 脚本目录：
+
+```text
+Counter-Strike Global Offensive/game/bin/win64/lua
+```
+
+脚本列表中的“自动加载”是逐脚本保存的。未勾选的脚本不会在插件启动时自动运行。
+
+## Neverlose 风格热键
+
+```lua
+local group = ui.create("功能")
+local bind = group:hotkey("功能热键", 0x46) -- F 键
+
+bind:set_callback(function(ref)
+    print("当前状态：", ref:get())
+end)
+
+events.render(function()
+    if bind:get() then
+        -- 功能逻辑
+    end
+end)
+```
+
+- 左键点击热键控件：监听并绑定下一次按键。
+- `Esc`：取消本次监听。
+- 右键点击热键控件：选择“长按触发”或“按下按键切换”。
+- 触发时控件文字和左侧状态标记会变色。
+- `ui.get_binds()` 可取得当前脚本创建的热键状态、模式、按键值和引用。
+
+## 目录结构
+
+```text
+src/injector/                 中文无边框注入器与驱动通信
+src/plugin/                   插件运行时
+src/plugin/lua/               LuaEngine 与嵌入式兼容库
+src/plugin/lua/libraries/     Neverlose/Panorama/entity 兼容层
+src/plugin/ui/                DX11 ImGui 菜单及分辨率同步
+src/plugin/events/            Source 2 游戏事件桥接
+scripts/                      示例与测试 Lua
+api-wiki/                     API 文档
+```
+
+## 常用热键
+
+| 热键 | 功能 |
+|---|---|
+| `Home` | 显示/隐藏 Lua 控制中心 |
+| `End` | 卸载插件 |
+| `F8` | 在控制台打印脚本列表 |
+
+## 联系方式
+
+- QQ 群：`1063275679`
+- 加群链接：https://qm.qq.com/q/QuzGioOKMS
+- GitHub：https://github.com/danqun51/CS2-LUA

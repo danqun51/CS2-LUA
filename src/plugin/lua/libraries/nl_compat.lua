@@ -1,6 +1,6 @@
 ﻿-- Neverlose-style compatibility layer for CS2LuaPlugin.
 -- Native-backed namespaces (events/entity/render) may extend these tables.
-CS2LUA_API_VERSION = '1.0.1'
+CS2LUA_API_VERSION = '1.0.2'
 
 -- LuaJIT uses Lua 5.1 semantics, so provide the Lua 5.3-style UTF-8 helpers
 -- used by the compatibility layer and bundled example scripts.
@@ -18,10 +18,11 @@ end
 -- these Lua objects preserve the documented MenuGroup/MenuItem interface.
 ui = ui or {}
 local ui_item_mt,ui_group_mt={},{}
-local ui_registry,ui_locales={},{}
+local ui_registry,ui_locales,ui_hotkeys={},{},{}
 local function wrap_ui_item(id,name,kind,items)
   local value={_id=id,_name=name,_type=kind,_items=items or {},_tooltip=nil,_override=nil}
   ui_registry[name]=value
+  if kind=='hotkey' then ui_hotkeys[#ui_hotkeys+1]=value end
   return setmetatable(value,{__index=ui_item_mt})
 end
 local function option_list(...)
@@ -78,14 +79,36 @@ function ui_item_mt:name(value) if value~=nil then self._name=tostring(value) en
 function ui_item_mt:tooltip(value) if value~=nil then self._tooltip=value end return self._tooltip end
 function ui_item_mt:visibility(value) if value==nil then return ui_native._state(self._id,'visible') end return ui_native._state(self._id,'visible',value) end
 function ui_item_mt:disabled(value) if value==nil then return ui_native._state(self._id,'disabled') end return ui_native._state(self._id,'disabled',value) end
-function ui_item_mt:set_callback(callback,force_call) ui_native._set_callback(self._id,callback); if force_call then callback() end; return self end
-function ui_item_mt:unset_callback() ui_native._set_callback(self._id,nil); return self end
+function ui_item_mt:set_callback(callback,force_call)
+  self._callback=callback
+  self._callback_wrapper=callback and function() callback(self) end or nil
+  ui_native._set_callback(self._id,self._callback_wrapper)
+  if force_call and callback then callback(self) end
+  return self
+end
+function ui_item_mt:unset_callback(callback)
+  if callback==nil or callback==self._callback then
+    self._callback,self._callback_wrapper=nil,nil
+    ui_native._set_callback(self._id,nil)
+  end
+  return self
+end
 function ui.find(...) local args={...}; return ui_registry[tostring(args[#args])] end
 function ui.get_alpha() return 1 end
 function ui.get_size() return vector(620,430,0) end
 function ui.get_position() return vector(0,0,0) end
 function ui.get_mouse_position() return vector(0,0,0) end
-function ui.get_binds() return {} end
+function ui.get_binds()
+  local binds={}
+  for _,reference in ipairs(ui_hotkeys) do
+    local key,mode,active=ui_native._hotkey_info(reference._id)
+    if key~=nil then
+      binds[#binds+1]={name=reference._name,mode=mode,value=key,
+        active=active,reference=reference}
+    end
+  end
+  return binds
+end
 function ui.get_style(name) local styles={accent=color(148,72,255,255)}; return name and styles[name] or styles end
 function ui.get_icon(name) return name=='gear' and '⚙' or tostring(name or '') end
 function ui.sidebar(name,icon) return name,icon end
@@ -173,11 +196,24 @@ function utils.lerp(a,b,t) return a+(b-a)*t end
 local delayed={}
 function utils.execute_after(delay, callback, ...)
   assert(type(callback)=='function','callback must be a function')
-  delayed[#delayed+1]={at=os.clock()+(delay or 0),fn=callback,args={...}}
+  delayed[#delayed+1]={at=os.clock()+(delay or 0),fn=callback,args={...},owner=rawget(_G,'__cs2lua_active_script')}
 end
 function __nl_process_timers()
   local now=os.clock()
-  for i=#delayed,1,-1 do local job=delayed[i]; if now>=job.at then table.remove(delayed,i); job.fn(table.unpack(job.args)) end end
+  for i=#delayed,1,-1 do
+    local job=delayed[i]
+    if now>=job.at then
+      table.remove(delayed,i)
+      local previous=rawget(_G,'__cs2lua_active_script')
+      rawset(_G,'__cs2lua_active_script',job.owner)
+      local ok,err=pcall(job.fn,table.unpack(job.args))
+      rawset(_G,'__cs2lua_active_script',previous)
+      if not ok then error(err,0) end
+    end
+  end
+end
+function __nl_cancel_script_timers(owner)
+  for i=#delayed,1,-1 do if delayed[i].owner==owner then table.remove(delayed,i) end end
 end
 local function empty_trace(from,to)
   local tr={start_pos=from,end_pos=to,fraction=1,contents=0,disp_flags=0,all_solid=false,start_solid=false,
@@ -259,10 +295,10 @@ function db.write(k,v) db_store[k]=v; return true end
 function db.delete(k) db_store[k]=nil end
 
 files = files or {}
-function files.read(path) local f=io.open(path,'rb'); if not f then return nil end local d=f:read('*a'); f:close(); return d end
-function files.write(path,data) local f=assert(io.open(path,'wb')); f:write(data); f:close(); return true end
-function files.append(path,data) local f=assert(io.open(path,'ab')); f:write(data); f:close(); return true end
-function files.exists(path) local f=io.open(path,'rb'); if f then f:close(); return true end return false end
+files.read = files.read or function(path) local f=io.open(path,'rb'); if not f then return nil end local d=f:read('*a'); f:close(); return d end
+files.write = files.write or function(path,data) local f=assert(io.open(path,'wb')); f:write(data); f:close(); return true end
+files.append = files.append or function(path,data) local f=assert(io.open(path,'ab')); f:write(data); f:close(); return true end
+files.exists = files.exists or function(path) local f=io.open(path,'rb'); if f then f:close(); return true end return false end
 
 -- LuaJIT provides the native BitOp-compatible `bit` module.
 bit = bit or require('bit')

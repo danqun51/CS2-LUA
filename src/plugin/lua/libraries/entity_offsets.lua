@@ -1,9 +1,9 @@
 ﻿-- Auto-generated from output/offsets.json and output/client_dll.json.
 return {
-  dwEntityList=39116368,
-  dwLocalPlayerPawn=37368376,
-  dwLocalPlayerController=37215136,
-  dwGameRules=37366232,
+  dwEntityList=39120480,
+  dwLocalPlayerPawn=37372472,
+  dwLocalPlayerController=37219232,
+  dwGameRules=37370328,
   base={
     m_iHealth=844,
     m_iMaxHealth=840,

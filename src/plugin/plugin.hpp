@@ -12,6 +12,8 @@ class PluginRuntime {
 
   void run();
   void request_stop();
+  LuaEngine& lua_engine() { return lua_; }
+  MenuController& menu_controller() { return menu_; }
 
  private:
   void setup_console();

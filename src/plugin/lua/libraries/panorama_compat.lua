@@ -1,8 +1,8 @@
-local ffi = ffi or require('ffi')
+﻿local ffi = ffi or require('ffi')
 local _INFO, cast, typeof, new, string, metatype, WRAPPER_TYPE, UNLOAD_WRAPPER, find_pattern, create_interface, safe_mode, ffiCEnabled, shutdown, _error, exception, exceptionCb, rawgetImpl, rawsetImpl, __thiscall, table_copy, vtable_bind, interface_ptr, vtable_entry, vtable_thunk, get_relative_call, proc_bind, follow_call, v8js_args, v8js_function, is_array, nullptr, intbuf, panorama, vtable, DllImport, UIEngine, nativeCompileRunScript, nativeGetIsolate, nativeHandleException, nativeGetRootID, nativeGetPanelContext, jsContexts, v8_dll, pIsolate, persistentTbl, Message, Local, MaybeLocal, PersistentProxy_mt, Persistent, Value, Object, Array, Function, FunctionTemplate, FunctionCallbackInfo, Primitive, Null, Undefined, Boolean, Number, Integer, String, Isolate, Context, HandleScope, TryCatch, Script, panelArray
 _INFO = {
-    _VERSION = 4.1
-    ,_BACKEND = 'pure-lua-ffi'
+    _VERSION = 4.7
+    ,_BACKEND = 'luv8-source2-compatible'
     ,_UPSTREAM = 'Shir0ha/luv8 source2 14b9abb'
 }
 setmetatable(_INFO, {
@@ -36,9 +36,13 @@ ffiCEnabled = ffi.C and api ~= 'gamesense'
 shutdown = function()
     local handles = persistentTbl or { }
     persistentTbl = { }
-    for _, v in pairs(handles) do
-        Persistent(v):disposeGlobal()
-    end
+    -- Never call DisposeGlobal from an ffi __gc callback. LuaJIT can run this
+    -- on an arbitrary callback/unwind boundary where Panorama's isolate has no
+    -- entered HandleScope. Disposing there corrupts V8's scope stack. The
+    -- handles are process-owned and are safely reclaimed with the isolate.
+    -- Normal proxy finalizers are still drained by drainPersistentDisposals()
+    -- during the next guarded V8 entry.
+    for k in pairs(handles) do handles[k] = nil end
 end
 _error = error
 exception = function(msg)
@@ -286,6 +290,10 @@ jsContexts = { }
 v8_dll = DllImport('v8.dll')
 pIsolate = nativeGetIsolate()
 persistentTbl = { }
+-- V8 keeps the raw C function pointer supplied to FunctionTemplate::New.
+-- LuaJIT otherwise collects the temporary ffi.cast callback after the call,
+-- leaving V8 with an executable pointer to freed callback memory.
+local v8CallbackRefs = { }
 local pendingPersistentDisposals = { }
 local PersistentFinalizer_t = typeof('struct { void* handle; }')
 
@@ -294,11 +302,12 @@ local function persistentKey(handle)
 end
 
 local function queuePersistentDispose(handle)
-    if handle == nil or handle == nullptr then return end
-    local key = persistentKey(handle)
-    if persistentTbl[key] ~= nil then
-        pendingPersistentDisposals[key] = handle
-    end
+    -- Do not DisposeGlobal during script reload/GC. V8 global handles can be
+    -- finalized only while the owning isolate and its correct thread/context
+    -- are active. LuaJIT GC timing does not provide that guarantee. Upstream
+    -- luv8 effectively keeps these references for the isolate lifetime too.
+    -- A small handle leak is preferable to corrupting V8's handle stack.
+    return
 end
 
 local function makePersistentFinalizer(handle)
@@ -312,14 +321,7 @@ local function makePersistentFinalizer(handle)
 end
 
 local function drainPersistentDisposals()
-    local pending = pendingPersistentDisposals
     pendingPersistentDisposals = { }
-    for key, handle in pairs(pending) do
-        if persistentTbl[key] ~= nil then
-            persistentTbl[key] = nil
-            Persistent(handle):disposeGlobal()
-        end
-    end
 end
 
 local activePanel
@@ -360,7 +362,10 @@ do
             local pPersistent = v8_dll:get('?GlobalizeReference@api_internal@v8@@YAPEA_KPEAVIsolate@internal@2@_K@Z', 'void*(__fastcall*)(void*,void*)')(pIsolate, self.this[0])
             local persistent = Persistent(pPersistent, 'Value', activePanel)
             persistent.finalizer = makePersistentFinalizer(pPersistent)
-            persistentTbl[persistentKey(pPersistent)] = pPersistent
+            persistentTbl[persistentKey(pPersistent)] = {
+                handle = pPersistent,
+                owner = rawget(_G, '__cs2lua_active_script')
+            }
             return persistent
         end,
         __call = function(self)
@@ -528,20 +533,25 @@ PersistentProxy_mt = {
         local terminateExecution = false
         local ret = HandleScope()(function()
             local tryCatch = TryCatch()
-            tryCatch:enter()
-            local rawReturn = this:getAsValue():toFunction():setParent(rawget(self, 'parent'))(unpack(args)):toLocalChecked()
-            if tryCatch:hasCaught() then
-                nativeHandleException(tryCatch:getInternal(), rawget(self, 'panel') or this.contextPanel or panorama.getPanel("CSGOHud"))
-                if safe_mode then
-                    terminateExecution = true
+            local tryCatchEntered = false
+            local rawReturn
+            local ok, failure = xpcall(function()
+                tryCatch:enter()
+                tryCatchEntered = true
+                rawReturn = this:getAsValue():toFunction():setParent(rawget(self, 'parent'))(unpack(args)):toLocalChecked()
+                if tryCatch:hasCaught() then
+                    nativeHandleException(tryCatch:getInternal(), rawget(self, 'panel') or this.contextPanel or panorama.getPanel("CSGOHud"))
+                    if safe_mode then terminateExecution = true end
                 end
-            end
-            tryCatch:exit()
-            if rawReturn == nil then
-                return nil
-            else
-                return rawReturn():toLua()
-            end
+            end, function(err) return err end)
+
+            -- TryCatch is part of V8's thread-local exception stack. It must be
+            -- destructed before Context::Exit even when argument conversion or
+            -- the native call raises a Lua error.
+            if tryCatchEntered then tryCatch:exit() end
+            if not ok then return _error(failure, 0) end
+            if rawReturn == nil then return nil end
+            return rawReturn():toLua()
         end, rawget(self, 'panel') or this.contextPanel)
         if terminateExecution then
             error("\n\nFailed to call the given javascript function, please check the error message above ^ \n\n(definitely not because I was too lazy to implement my own exception handler)\n")
@@ -931,7 +941,17 @@ do
     _base_0.__index = _base_0
     _class_0 = setmetatable({
         __init = function(self, callback)
-            self.this = MaybeLocal(v8_dll:get('?New@FunctionTemplate@v8@@SA?AV?$Local@VFunctionTemplate@v8@@@2@PEAVIsolate@2@P6AXAEBV?$FunctionCallbackInfo@VValue@v8@@@2@@ZV?$Local@VValue@v8@@@2@V?$Local@VSignature@v8@@@2@HW4ConstructorBehavior@2@W4SideEffectType@2@PEBVCFunction@2@GGG@Z', 'void*(__fastcall*)(void*, void*, void*, void*, void*, int, int, int, int, uint16_t, uint16_t, uint16_t)')(intbuf, pIsolate, cast('void(__fastcall*)(void******)', callback), nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0)):toLocalChecked()
+            local callbackRef = { callback = callback }
+            local nativeCallback = cast('void(__fastcall*)(void******)', function(info)
+                local active = callbackRef.callback
+                if active ~= nil then return active(info) end
+            end)
+            v8CallbackRefs[#v8CallbackRefs + 1] = {
+                callback = nativeCallback,
+                target = callbackRef,
+                owner = rawget(_G, '__cs2lua_active_script')
+            }
+            self.this = MaybeLocal(v8_dll:get('?New@FunctionTemplate@v8@@SA?AV?$Local@VFunctionTemplate@v8@@@2@PEAVIsolate@2@P6AXAEBV?$FunctionCallbackInfo@VValue@v8@@@2@@ZV?$Local@VValue@v8@@@2@V?$Local@VSignature@v8@@@2@HW4ConstructorBehavior@2@W4SideEffectType@2@PEBVCFunction@2@GGG@Z', 'void*(__fastcall*)(void*, void*, void*, void*, void*, int, int, int, int, uint16_t, uint16_t, uint16_t)')(intbuf, pIsolate, nativeCallback, nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0)):toLocalChecked()
         end,
         __base = _base_0,
         __name = "FunctionTemplate"
@@ -1433,6 +1453,9 @@ do
                     _error('unable to resolve a V8 context for the selected Panorama panel', 0)
                 end
 
+                -- v8::Local<T> is passed to these exported wrapper methods as
+                -- its handle slot. Do not dereference it to T*: the source2 V8
+                -- ABI expects the Local storage here.
                 ctx = Context(self:createHandle(rawContext[0]))
                 if ctx:getInternal() == nil or ctx:getInternal() == nullptr then
                     _error('unable to create a local V8 context handle', 0)
@@ -1444,7 +1467,7 @@ do
                 return err
             end)
 
-            if contextEntered then pcall(function() ctx:exit() end) end
+            if contextEntered then ctx:exit() end
             if scopeEntered then pcall(function() self:exit() end) end
             if isolateEntered then pcall(function() isolate:exit() end) end
             activePanel = previousPanel
@@ -1789,7 +1812,37 @@ panorama.setSafeMode = function(enabled)
     safe_mode = enabled
 end
 panorama.info = _INFO
-panorama.flush = shutdown
+panorama._flush_script = function(owner)
+    if owner == nil then return 0 end
+    local disposed = 0
+    local dispose = v8_dll:get('?DisposeGlobal@api_internal@v8@@YAXPEA_K@Z', 'void(__fastcall*)(void*)')
+    for key, entry in pairs(persistentTbl) do
+        if entry.owner == owner then
+            local handle = entry.handle
+            persistentTbl[key] = nil
+            if handle ~= nil and handle ~= nullptr then
+                local ok = pcall(dispose, handle)
+                if ok then disposed = disposed + 1 end
+            end
+        end
+    end
+    -- V8 may retain FunctionTemplate callbacks inside Panorama objects that are
+    -- not represented by our Persistent wrappers. Keep those ffi callback
+    -- thunks alive for the isolate lifetime, but detach their Lua targets so an
+    -- old Panorama object can only call a no-op after its script is unloaded.
+    for i = 1, #v8CallbackRefs do
+        local entry = v8CallbackRefs[i]
+        if entry.owner == owner then entry.target.callback = nil end
+    end
+    pendingPersistentDisposals = { }
+    collectgarbage('collect')
+    return disposed
+end
+panorama.flush = function()
+    local owner = rawget(_G, '__cs2lua_active_script')
+    if owner ~= nil then return panorama._flush_script(owner) end
+    return 0
+end
 panorama.pairs = function(t)
     local metatable = getmetatable(t)
     if metatable and metatable.__pairs then
@@ -1840,3 +1893,7 @@ setmetatable(panorama, {
 })
 package.loaded.panorama_compat = panorama
 return panorama
+
+
+
+
